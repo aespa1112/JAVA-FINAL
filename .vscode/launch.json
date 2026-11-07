@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "java",
+            "name": "執行記帳系統 (Launcher - 推薦)",
+            "request": "launch",
+            "mainClass": "com.ledger.Launcher",
+            "projectName": "accountant-ledger",
+            "console": "internalConsole",
+            "shortenCommandLine": "auto"
+        },
+        {
+            "type": "java",
+            "name": "執行記帳系統 (整合終端機)",
+            "request": "launch",
+            "mainClass": "com.ledger.Launcher",
+            "projectName": "accountant-ledger",
+            "console": "integratedTerminal",
+            "shortenCommandLine": "auto"
+        }
+    ]
+}

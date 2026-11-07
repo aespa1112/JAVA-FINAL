@@ -1,0 +1,55 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "執行 JavaFX 桌面系統 (mvn javafx:run)",
+            "type": "shell",
+            "command": "C:\\Users\\USER\\tools\\apache-maven-3.9.9\\bin\\mvn.cmd",
+            "args": [
+                "javafx:run"
+            ],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "執行全套測試 (mvn test)",
+            "type": "shell",
+            "command": "C:\\Users\\USER\\tools\\apache-maven-3.9.9\\bin\\mvn.cmd",
+            "args": [
+                "test"
+            ],
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "編譯專案 (mvn compile)",
+            "type": "shell",
+            "command": "C:\\Users\\USER\\tools\\apache-maven-3.9.9\\bin\\mvn.cmd",
+            "args": [
+                "compile"
+            ],
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel": "shared"
+            },
+            "problemMatcher": []
+        }
+    ]
+}

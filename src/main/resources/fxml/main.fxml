@@ -1,0 +1,234 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<?import javafx.geometry.Insets?>
+<?import javafx.scene.control.*?>
+<?import javafx.scene.layout.*?>
+
+<VBox xmlns="http://javafx.com/javafx/21" xmlns:fx="http://javafx.com/fxml/1"
+      fx:controller="com.ledger.controller.MainController"
+      prefHeight="760.0" prefWidth="1100.0" stylesheets="@../css/style.css">
+
+    <!-- 頂部帳套與操作員導航欄 -->
+    <HBox styleClass="header-bar">
+        <Label text="會計師專業記帳與審計軌跡系統" styleClass="app-title"/>
+        <Region HBox.hgrow="ALWAYS"/>
+        
+        <Label text="客戶帳套:" styleClass="client-label"/>
+        <ComboBox fx:id="clientCombo" prefWidth="180"/>
+        <Button text="+ 新帳套" onAction="#onNewClient" styleClass="button-secondary"/>
+        <Button text="一鍵備份" onAction="#onBackupClient" styleClass="button-success"/>
+        <Button text="還原" onAction="#onRestoreClient" styleClass="button-warning"/>
+        
+        <Separator orientation="VERTICAL"/>
+        <Label text="操作員:" styleClass="client-label"/>
+        <ComboBox fx:id="operatorCombo" prefWidth="200"/>
+    </HBox>
+
+    <!-- 核心功能模組分頁 -->
+    <TabPane VBox.vgrow="ALWAYS" tabClosingPolicy="UNAVAILABLE">
+        <!-- Tab 1: 傳票錄入與管理 -->
+        <Tab text="傳票錄入與過帳">
+            <VBox spacing="10" style="-fx-padding: 12px;">
+                <HBox spacing="10" alignment="CENTER_LEFT">
+                    <Button text="+ 新增傳票" onAction="#onNewVoucher" styleClass="button"/>
+                    <Button text="✔ 審核過帳" onAction="#onPostVoucher" styleClass="button-success"/>
+                    <Button text="↩ 紅字沖銷" onAction="#onReverseVoucher" styleClass="button-warning"/>
+                    <Button text="✖ 刪除草稿" onAction="#onDeleteVoucher" styleClass="button-danger"/>
+                    <Region HBox.hgrow="ALWAYS"/>
+                    <Label text="狀態:"/>
+                    <ComboBox fx:id="voucherStatusFilter" prefWidth="110"/>
+                    <TextField fx:id="voucherKeywordFilter" promptText="搜尋摘要或編號..." onAction="#loadVouchers" prefWidth="180"/>
+                    <Button text="查詢" onAction="#loadVouchers" styleClass="button-secondary"/>
+                </HBox>
+
+                <!-- 上方傳票清單 -->
+                <Label text="傳票主檔清單 (點選查看下方分錄明細)" style="-fx-font-weight: bold; -fx-text-fill: #334155;"/>
+                <TableView fx:id="voucherTable" prefHeight="260" VBox.vgrow="ALWAYS">
+                    <columns>
+                        <TableColumn fx:id="colVoucherNo" text="傳票號碼" prefWidth="130"/>
+                        <TableColumn fx:id="colVoucherDate" text="憑證日期" prefWidth="100"/>
+                        <TableColumn fx:id="colSummary" text="傳票摘要" prefWidth="260"/>
+                        <TableColumn fx:id="colStatus" text="狀態" prefWidth="90"/>
+                        <TableColumn fx:id="colPreparer" text="制單人" prefWidth="90"/>
+                        <TableColumn fx:id="colReviewer" text="審核人" prefWidth="90"/>
+                        <TableColumn fx:id="colTotalDebit" text="借方總額" prefWidth="110" styleClass="money-cell"/>
+                        <TableColumn fx:id="colTotalCredit" text="貸方總額" prefWidth="110" styleClass="money-cell"/>
+                        <TableColumn fx:id="colReversedId" text="沖銷關聯" prefWidth="100"/>
+                    </columns>
+                </TableView>
+
+                <!-- 下方分錄明細 -->
+                <Label text="分錄複式記帳明細 (Voucher Entries)" style="-fx-font-weight: bold; -fx-text-fill: #334155;"/>
+                <TableView fx:id="entryTable" prefHeight="180">
+                    <columns>
+                        <TableColumn fx:id="colEntryLine" text="序號" prefWidth="60"/>
+                        <TableColumn fx:id="colEntryCode" text="科目代碼" prefWidth="100"/>
+                        <TableColumn fx:id="colEntryName" text="會計科目名稱" prefWidth="200"/>
+                        <TableColumn fx:id="colEntryMemo" text="備註摘要" prefWidth="260"/>
+                        <TableColumn fx:id="colEntryDebit" text="借方金額 (Debit)" prefWidth="140" styleClass="money-cell"/>
+                        <TableColumn fx:id="colEntryCredit" text="貸方金額 (Credit)" prefWidth="140" styleClass="money-cell"/>
+                    </columns>
+                </TableView>
+            </VBox>
+        </Tab>
+        <!-- Tab 2: 會計科目維護 -->
+        <Tab text="會計科目管理">
+            <VBox spacing="10" style="-fx-padding: 12px;">
+                <HBox spacing="10" alignment="CENTER_LEFT">
+                    <Button text="+ 新增會計科目" onAction="#onNewAccount" styleClass="button"/>
+                    <Button text="重新整理" onAction="#loadAccounts" styleClass="button-secondary"/>
+                    <Region HBox.hgrow="ALWAYS"/>
+                    <Label text="標準會計科目五大類：資產 (1)、負債 (2)、權益 (3)、收入 (4)、費用 (5)" style="-fx-text-fill: #64748b;"/>
+                </HBox>
+                <TableView fx:id="accountTable" VBox.vgrow="ALWAYS">
+                    <columns>
+                        <TableColumn fx:id="colAccCode" text="科目代碼" prefWidth="120"/>
+                        <TableColumn fx:id="colAccName" text="會計科目名稱" prefWidth="280"/>
+                        <TableColumn fx:id="colAccType" text="科目分類 (Type)" prefWidth="150"/>
+                        <TableColumn fx:id="colAccSide" text="正常借貸方 (Normal Side)" prefWidth="160"/>
+                        <TableColumn fx:id="colAccStatus" text="使用狀態" prefWidth="100"/>
+                    </columns>
+                </TableView>
+            </VBox>
+        </Tab>
+
+        <!-- Tab 3: 期間結帳 -->
+        <Tab text="會計期間與結帳">
+            <VBox spacing="10" style="-fx-padding: 12px;">
+                <HBox spacing="10" alignment="CENTER_LEFT">
+                    <Button text="🔒 執行期末結帳 (鎖定)" onAction="#onClosePeriod" styleClass="button-warning"/>
+                    <Button text="🔓 反結帳 (重新開啟)" onAction="#onReopenPeriod" styleClass="button-secondary"/>
+                    <Button text="重新整理" onAction="#loadPeriods" styleClass="button-secondary"/>
+                    <Region HBox.hgrow="ALWAYS"/>
+                    <Label text="結帳鎖定後該期間將嚴格禁止新增或更動憑證（資料庫 Trigger 自動保護）" style="-fx-text-fill: #b45309; -fx-font-weight: bold;"/>
+                </HBox>
+                <TableView fx:id="periodTable" VBox.vgrow="ALWAYS">
+                    <columns>
+                        <TableColumn fx:id="colPeriodYear" text="年度" prefWidth="120"/>
+                        <TableColumn fx:id="colPeriodMonth" text="月份" prefWidth="150"/>
+                        <TableColumn fx:id="colPeriodStatus" text="期間狀態" prefWidth="200"/>
+                    </columns>
+                </TableView>
+            </VBox>
+        </Tab>
+
+        <!-- Tab 4: 帳簿與財務報表 -->
+        <Tab text="帳簿與財務報表">
+            <VBox spacing="10" style="-fx-padding: 12px;">
+                <HBox spacing="10" alignment="CENTER_LEFT">
+                    <Label text="查詢區間:"/>
+                    <DatePicker fx:id="reportStartDatePicker" promptText="開始日期" prefWidth="130"/>
+                    <Label text="至"/>
+                    <DatePicker fx:id="reportEndDatePicker" promptText="結束日期" prefWidth="130"/>
+                    <Button text="產生報表" onAction="#loadReports" styleClass="button"/>
+                    <Button text="匯出試算表 CSV" onAction="#onExportReportCsv" styleClass="button-success"/>
+                </HBox>
+
+                <TabPane VBox.vgrow="ALWAYS" tabClosingPolicy="UNAVAILABLE">
+                    <Tab text="試算表 (Trial Balance)">
+                        <TableView fx:id="tbTable">
+                            <columns>
+                                <TableColumn fx:id="colTbCode" text="科目代碼" prefWidth="110"/>
+                                <TableColumn fx:id="colTbName" text="科目名稱" prefWidth="220"/>
+                                <TableColumn fx:id="colTbType" text="類別" prefWidth="120"/>
+                                <TableColumn fx:id="colTbDebit" text="借方合計 (Debit)" prefWidth="150" styleClass="money-cell"/>
+                                <TableColumn fx:id="colTbCredit" text="貸方合計 (Credit)" prefWidth="150" styleClass="money-cell"/>
+                                <TableColumn fx:id="colTbNet" text="淨餘額 (Net Balance)" prefWidth="150" styleClass="money-cell"/>
+                            </columns>
+                        </TableView>
+                    </Tab>
+                    <Tab text="資產負債表 (Balance Sheet)">
+                        <TableView fx:id="bsTable">
+                            <columns>
+                                <TableColumn fx:id="colBsSection" text="報表分類" prefWidth="150"/>
+                                <TableColumn fx:id="colBsCode" text="代號" prefWidth="120"/>
+                                <TableColumn fx:id="colBsName" text="會計科目" prefWidth="280"/>
+                                <TableColumn fx:id="colBsAmount" text="金額" prefWidth="180" styleClass="money-cell"/>
+                            </columns>
+                        </TableView>
+                    </Tab>
+                    <Tab text="損益表 (Income Statement)">
+                        <TableView fx:id="isTable">
+                            <columns>
+                                <TableColumn fx:id="colIsSection" text="報表分類" prefWidth="180"/>
+                                <TableColumn fx:id="colIsCode" text="代號" prefWidth="120"/>
+                                <TableColumn fx:id="colIsName" text="會計項目" prefWidth="280"/>
+                                <TableColumn fx:id="colIsAmount" text="本期金額" prefWidth="180" styleClass="money-cell"/>
+                            </columns>
+                        </TableView>
+                    </Tab>
+                    <Tab text="總分類帳 (General Ledger)">
+                        <VBox spacing="8" style="-fx-padding: 8px;">
+                            <HBox spacing="10" alignment="CENTER_LEFT">
+                                <Label text="選取科目:"/>
+                                <ComboBox fx:id="glAccountCombo" prefWidth="280" onAction="#loadReports"/>
+                            </HBox>
+                            <TableView fx:id="glTable" VBox.vgrow="ALWAYS">
+                                <columns>
+                                    <TableColumn fx:id="colGlDate" text="憑證日期" prefWidth="110"/>
+                                    <TableColumn fx:id="colGlVoucherNo" text="傳票編號" prefWidth="130"/>
+                                    <TableColumn fx:id="colGlSummary" text="傳票摘要" prefWidth="240"/>
+                                    <TableColumn fx:id="colGlMemo" text="分錄備註" prefWidth="180"/>
+                                    <TableColumn fx:id="colGlDebit" text="借方金額" prefWidth="130" styleClass="money-cell"/>
+                                    <TableColumn fx:id="colGlCredit" text="貸方金額" prefWidth="130" styleClass="money-cell"/>
+                                    <TableColumn fx:id="colGlBalance" text="累積餘額" prefWidth="140" styleClass="money-cell"/>
+                                </columns>
+                            </TableView>
+                        </VBox>
+                    </Tab>
+                </TabPane>
+            </VBox>
+        </Tab>
+        <!-- Tab 5: FTS5 全文檢索 -->
+        <Tab text="全文檢索 (FTS5)">
+            <VBox spacing="10" style="-fx-padding: 12px;">
+                <HBox spacing="10" alignment="CENTER_LEFT">
+                    <Label text="查帳檢索:"/>
+                    <TextField fx:id="ftsField" promptText="輸入摘要關鍵字（如：設備、伺服器、文具、差旅...）" onAction="#onFtsSearch" prefWidth="350"/>
+                    <Button text="🔍 立即檢索" onAction="#onFtsSearch" styleClass="button"/>
+                    <Region HBox.hgrow="ALWAYS"/>
+                    <Label text="技術特色：SQLite FTS5 虛擬表毫秒級中文字串索引" style="-fx-text-fill: #2563eb; -fx-font-weight: bold;"/>
+                </HBox>
+                <TableView fx:id="ftsTable" VBox.vgrow="ALWAYS">
+                    <columns>
+                        <TableColumn fx:id="colFtsDate" text="憑證日期" prefWidth="110"/>
+                        <TableColumn fx:id="colFtsNo" text="傳票編號" prefWidth="140"/>
+                        <TableColumn fx:id="colFtsSummary" text="摘要內容 (FTS5 比對)" prefWidth="420"/>
+                        <TableColumn fx:id="colFtsStatus" text="過帳狀態" prefWidth="100"/>
+                        <TableColumn fx:id="colFtsAmount" text="傳票金額" prefWidth="140" styleClass="money-cell"/>
+                    </columns>
+                </TableView>
+            </VBox>
+        </Tab>
+
+        <!-- Tab 6: 審計軌跡日誌 -->
+        <Tab text="審計日誌 (Audit Trail)">
+            <VBox spacing="10" style="-fx-padding: 12px;">
+                <HBox spacing="10" alignment="CENTER_LEFT">
+                    <Button text="重新整理日誌" onAction="#loadAudits" styleClass="button-secondary"/>
+                    <Region HBox.hgrow="ALWAYS"/>
+                    <Label text="依法規與 GAAP 要求：所有制單、過帳、沖銷、修改皆有完整審計軌跡，不可篡改" style="-fx-text-fill: #475569; -fx-font-weight: bold;"/>
+                </HBox>
+                <TableView fx:id="auditTable" VBox.vgrow="ALWAYS">
+                    <columns>
+                        <TableColumn fx:id="colAuditId" text="日誌序號" prefWidth="80"/>
+                        <TableColumn fx:id="colAuditAction" text="操作動作" prefWidth="130"/>
+                        <TableColumn fx:id="colAuditTarget" text="操作目標" prefWidth="110"/>
+                        <TableColumn fx:id="colAuditRecordId" text="記錄 ID" prefWidth="80"/>
+                        <TableColumn fx:id="colAuditOperator" text="操作人員" prefWidth="110"/>
+                        <TableColumn fx:id="colAuditOldData" text="原資料狀態" prefWidth="180"/>
+                        <TableColumn fx:id="colAuditNewData" text="新資料狀態" prefWidth="180"/>
+                        <TableColumn fx:id="colAuditTime" text="操作時間 (Local Time)" prefWidth="180"/>
+                    </columns>
+                </TableView>
+            </VBox>
+        </Tab>
+    </TabPane>
+
+    <!-- 底部狀態列 -->
+    <HBox styleClass="status-bar" spacing="20">
+        <Label fx:id="dbPathLabel" text="目前帳套: data/client_A.db" styleClass="status-text"/>
+        <Region HBox.hgrow="ALWAYS"/>
+        <Label fx:id="statusLabel" text="系統就緒" styleClass="status-text"/>
+    </HBox>
+</VBox>
