@@ -154,21 +154,6 @@ public class AdminController {
     }
 
     @FXML
-    public void onEnterSystem() {
-        try {
-            FXMLLoader loader = new FXMLLoader(getClass().getResource("/fxml/clientSelect.fxml"));
-            Parent root = loader.load();
-            Stage stage = (Stage) adminLabel.getScene().getWindow();
-            stage.setTitle("選擇客戶帳套");
-            stage.setScene(new Scene(root, 480, 420));
-            stage.setResizable(false);
-            stage.centerOnScreen();
-        } catch (Exception e) {
-            showError("進入系統失敗：" + e.getMessage());
-        }
-    }
-
-    @FXML
     public void onLogout() {
         SessionContext.clear();
         try {
