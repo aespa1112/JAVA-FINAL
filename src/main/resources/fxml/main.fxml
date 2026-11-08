@@ -22,6 +22,9 @@
         <Separator orientation="VERTICAL"/>
         <Label text="操作員:" styleClass="client-label"/>
         <ComboBox fx:id="operatorCombo" prefWidth="200"/>
+        <Separator orientation="VERTICAL"/>
+        <Button text="切換帳套" onAction="#onSwitchClient" styleClass="button-secondary"/>
+        <Button text="登出" onAction="#onLogout" styleClass="button-danger"/>
     </HBox>
 
     <!-- 核心功能模組分頁 -->
@@ -42,7 +45,6 @@
                     <Button text="查詢" onAction="#loadVouchers" styleClass="button-secondary"/>
                 </HBox>
 
-                <!-- 上方傳票清單 -->
                 <Label text="傳票主檔清單 (點選查看下方分錄明細，雙擊草稿可編輯)" style="-fx-font-weight: bold; -fx-text-fill: #334155;"/>
                 <TableView fx:id="voucherTable" prefHeight="260" VBox.vgrow="ALWAYS">
                     <columns>
@@ -58,7 +60,6 @@
                     </columns>
                 </TableView>
 
-                <!-- 下方分錄明細 -->
                 <Label text="分錄複式記帳明細 (Voucher Entries)" style="-fx-font-weight: bold; -fx-text-fill: #334155;"/>
                 <TableView fx:id="entryTable" prefHeight="180">
                     <columns>
@@ -73,7 +74,6 @@
             </VBox>
         </Tab>
 
-        <!-- Tab 2: 會計科目管理 -->
         <Tab text="會計科目管理">
             <VBox spacing="10" style="-fx-padding: 12px;">
                 <HBox spacing="10" alignment="CENTER_LEFT">
@@ -94,7 +94,6 @@
             </VBox>
         </Tab>
 
-        <!-- Tab 3: 期間結帳 -->
         <Tab text="會計期間與結帳">
             <VBox spacing="10" style="-fx-padding: 12px;">
                 <HBox spacing="10" alignment="CENTER_LEFT">
@@ -114,7 +113,6 @@
             </VBox>
         </Tab>
 
-        <!-- Tab 4: 帳簿與財務報表 -->
         <Tab text="帳簿與財務報表">
             <VBox spacing="10" style="-fx-padding: 12px;">
                 <HBox spacing="10" alignment="CENTER_LEFT">
@@ -182,7 +180,6 @@
             </VBox>
         </Tab>
 
-        <!-- Tab 5: FTS5 全文檢索 -->
         <Tab text="全文檢索 (FTS5)">
             <VBox spacing="10" style="-fx-padding: 12px;">
                 <HBox spacing="10" alignment="CENTER_LEFT">
@@ -204,7 +201,6 @@
             </VBox>
         </Tab>
 
-        <!-- Tab 6: 審計軌跡日誌 -->
         <Tab text="審計日誌 (Audit Trail)">
             <VBox spacing="10" style="-fx-padding: 12px;">
                 <HBox spacing="10" alignment="CENTER_LEFT">
@@ -228,7 +224,6 @@
         </Tab>
     </TabPane>
 
-    <!-- 底部狀態列 -->
     <HBox styleClass="status-bar" spacing="20">
         <Label fx:id="dbPathLabel" text="目前帳套: data/client_A.db" styleClass="status-text"/>
         <Region HBox.hgrow="ALWAYS"/>
