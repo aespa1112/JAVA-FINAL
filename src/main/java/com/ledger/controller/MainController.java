@@ -1,6 +1,7 @@
 package com.ledger.controller;
 
 import com.ledger.config.DbManager;
+import com.ledger.config.SessionContext;
 import com.ledger.dao.*;
 import com.ledger.exception.BusinessException;
 import com.ledger.model.*;
@@ -159,25 +160,48 @@ public class MainController {
     }
 
     private void initClientAndOperator() {
+        // 客戶帳套已在登入後選擇畫面決定，這裡顯示目前帳套並允許切換
+        String currentClient = SessionContext.getClientPath();
+        if (currentClient == null || currentClient.isBlank()) {
+            currentClient = "data/client_A.db";
+        }
         clientCombo.setItems(FXCollections.observableArrayList(
                 "data/client_A.db",
                 "data/client_B.db",
                 "data/client_C.db"
         ));
-        clientCombo.setValue("data/client_A.db");
+        if (!clientCombo.getItems().contains(currentClient)) {
+            clientCombo.getItems().add(currentClient);
+        }
+        clientCombo.setValue(currentClient);
         clientCombo.valueProperty().addListener((obs, oldVal, newVal) -> {
             if (newVal != null && !newVal.equals(oldVal)) {
                 switchClient(newVal);
             }
         });
 
+        // 操作員預設為登入使用者；仍可切換以方便口試示範職責分離
         operatorCombo.setItems(FXCollections.observableArrayList(
                 "Amy (記帳員/制單人)",
                 "Bob (會計師/審核人)",
                 "David (會計師/審核人)",
                 "Charlie (查帳員/審計員)"
         ));
-        operatorCombo.setValue("Amy (記帳員/制單人)");
+        String loginDisplay = SessionContext.getUserDisplay();
+        if (loginDisplay != null && operatorCombo.getItems().contains(loginDisplay)) {
+            operatorCombo.setValue(loginDisplay);
+        } else {
+            String user = SessionContext.getUser();
+            if ("Bob".equalsIgnoreCase(user)) {
+                operatorCombo.setValue("Bob (會計師/審核人)");
+            } else if ("David".equalsIgnoreCase(user)) {
+                operatorCombo.setValue("David (會計師/審核人)");
+            } else if ("Charlie".equalsIgnoreCase(user)) {
+                operatorCombo.setValue("Charlie (查帳員/審計員)");
+            } else {
+                operatorCombo.setValue("Amy (記帳員/制單人)");
+            }
+        }
 
         voucherStatusFilter.setItems(FXCollections.observableArrayList("ALL", "DRAFT", "POSTED", "VOID"));
         voucherStatusFilter.setValue("ALL");
@@ -889,6 +913,38 @@ public class MainController {
             auditTable.setItems(FXCollections.observableArrayList(list));
         } catch (SQLException e) {
             showError("載入審計日誌失敗", e.getMessage());
+        }
+    }
+
+    @FXML
+    public void onLogout() {
+        SessionContext.clear();
+        try {
+            DbManager.closeCurrent();
+            javafx.fxml.FXMLLoader loader = new javafx.fxml.FXMLLoader(getClass().getResource("/fxml/login.fxml"));
+            javafx.scene.Parent root = loader.load();
+            javafx.stage.Stage stage = (javafx.stage.Stage) statusLabel.getScene().getWindow();
+            stage.setTitle("登入 — 會計師專業記帳系統");
+            stage.setScene(new javafx.scene.Scene(root, 420, 480));
+            stage.setResizable(false);
+            stage.centerOnScreen();
+        } catch (Exception e) {
+            showError("登出失敗", e.getMessage());
+        }
+    }
+
+    @FXML
+    public void onSwitchClient() {
+        try {
+            javafx.fxml.FXMLLoader loader = new javafx.fxml.FXMLLoader(getClass().getResource("/fxml/clientSelect.fxml"));
+            javafx.scene.Parent root = loader.load();
+            javafx.stage.Stage stage = (javafx.stage.Stage) statusLabel.getScene().getWindow();
+            stage.setTitle("選擇客戶帳套");
+            stage.setScene(new javafx.scene.Scene(root, 480, 420));
+            stage.setResizable(false);
+            stage.centerOnScreen();
+        } catch (Exception e) {
+            showError("切換帳套畫面失敗", e.getMessage());
         }
     }
 
