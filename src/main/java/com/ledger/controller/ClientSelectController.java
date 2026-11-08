@@ -2,6 +2,7 @@ package com.ledger.controller;
 
 import com.ledger.config.DbManager;
 import com.ledger.config.SessionContext;
+import com.ledger.service.AuthService;
 import javafx.collections.FXCollections;
 import javafx.fxml.FXML;
 import javafx.fxml.FXMLLoader;
@@ -26,9 +27,16 @@ public class ClientSelectController {
     @FXML private Label errorLabel;
 
     private final List<String> clients = new ArrayList<>();
+    private final AuthService authService = new AuthService();
 
     @FXML
     public void initialize() {
+        // 管理員不可進入帳套選擇／會計系統，導回管理畫面
+        if (authService.isAdmin(SessionContext.getUser())) {
+            javafx.application.Platform.runLater(this::redirectAdminToPanel);
+            return;
+        }
+
         userLabel.setText("目前登入：" + SessionContext.getUserDisplay());
         errorLabel.setText("");
 
@@ -65,8 +73,28 @@ public class ClientSelectController {
         });
     }
 
+    private void redirectAdminToPanel() {
+        try {
+            FXMLLoader loader = new FXMLLoader(getClass().getResource("/fxml/admin.fxml"));
+            Parent root = loader.load();
+            Stage stage = (Stage) clientList.getScene().getWindow();
+            stage.setTitle("系統管理員 — 人員帳號管理");
+            stage.setScene(new Scene(root, 720, 520));
+            stage.setResizable(true);
+            stage.centerOnScreen();
+        } catch (Exception e) {
+            if (errorLabel != null) {
+                errorLabel.setText("管理員不可進入會計系統");
+            }
+        }
+    }
+
     @FXML
     public void onAddClient() {
+        if (authService.isAdmin(SessionContext.getUser())) {
+            errorLabel.setText("管理員不可操作帳套");
+            return;
+        }
         errorLabel.setText("");
         String name = newClientField.getText();
         if (name == null || name.trim().isEmpty()) {
@@ -92,6 +120,10 @@ public class ClientSelectController {
 
     @FXML
     public void onEnter() {
+        if (authService.isAdmin(SessionContext.getUser())) {
+            errorLabel.setText("管理員不可進入會計系統，僅能管理人員帳號");
+            return;
+        }
         errorLabel.setText("");
         String selected = clientList.getSelectionModel().getSelectedItem();
         if (selected == null || selected.isBlank()) {
