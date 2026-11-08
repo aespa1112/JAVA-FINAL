@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<?import javafx.geometry.Insets?>
+<?import javafx.scene.control.*?>
+<?import javafx.scene.layout.*?>
+
+<VBox xmlns="http://javafx.com/javafx/21" xmlns:fx="http://javafx.com/fxml/1"
+      fx:controller="com.ledger.controller.AdminController"
+      spacing="12" prefWidth="720" prefHeight="520"
+      stylesheets="@../css/style.css" style="-fx-background-color: #0f172a; -fx-padding: 24;">
+
+    <Label text="系統管理員 — 人員帳號管理" style="-fx-font-size: 20px; -fx-font-weight: bold; -fx-text-fill: #ffffff;"/>
+    <Label fx:id="adminLabel" text="" style="-fx-text-fill: #94a3b8; -fx-font-size: 12px;"/>
+
+    <HBox spacing="10" alignment="CENTER_LEFT">
+        <Button text="重新整理" onAction="#onRefresh" styleClass="button-secondary"/>
+        <Region HBox.hgrow="ALWAYS"/>
+        <Button text="進入會計系統" onAction="#onEnterSystem" styleClass="button-success"/>
+        <Button text="登出" onAction="#onLogout" styleClass="button-danger"/>
+    </HBox>
+
+    <TableView fx:id="userTable" VBox.vgrow="ALWAYS" prefHeight="220">
+        <columns>
+            <TableColumn fx:id="colUser" text="帳號" prefWidth="120"/>
+            <TableColumn fx:id="colDisplay" text="顯示名稱" prefWidth="220"/>
+            <TableColumn fx:id="colRole" text="角色" prefWidth="140"/>
+            <TableColumn fx:id="colStatus" text="狀態" prefWidth="80"/>
+        </columns>
+    </TableView>
+
+    <HBox spacing="8">
+        <Button text="啟用" onAction="#onEnable" styleClass="button-success"/>
+        <Button text="停用" onAction="#onDisable" styleClass="button-warning"/>
+        <Button text="重設密碼" onAction="#onResetPassword" styleClass="button-secondary"/>
+    </HBox>
+
+    <Separator/>
+
+    <Label text="新增人員帳號" style="-fx-text-fill: #e2e8f0; -fx-font-weight: bold;"/>
+    <GridPane hgap="10" vgap="8">
+        <Label text="帳號" style="-fx-text-fill: #cbd5e1;" GridPane.columnIndex="0" GridPane.rowIndex="0"/>
+        <TextField fx:id="newUsername" promptText="小寫英數，如 john" prefWidth="140" GridPane.columnIndex="1" GridPane.rowIndex="0"/>
+
+        <Label text="密碼" style="-fx-text-fill: #cbd5e1;" GridPane.columnIndex="2" GridPane.rowIndex="0"/>
+        <PasswordField fx:id="newPassword" promptText="至少 4 字元" prefWidth="140" GridPane.columnIndex="3" GridPane.rowIndex="0"/>
+
+        <Label text="顯示名稱" style="-fx-text-fill: #cbd5e1;" GridPane.columnIndex="0" GridPane.rowIndex="1"/>
+        <TextField fx:id="newDisplay" promptText="可空白，自動產生" prefWidth="140" GridPane.columnIndex="1" GridPane.rowIndex="1"/>
+
+        <Label text="角色" style="-fx-text-fill: #cbd5e1;" GridPane.columnIndex="2" GridPane.rowIndex="1"/>
+        <ComboBox fx:id="newRole" prefWidth="160" GridPane.columnIndex="3" GridPane.rowIndex="1"/>
+    </GridPane>
+
+    <HBox spacing="10" alignment="CENTER_LEFT">
+        <Button text="新增人員" onAction="#onCreateUser" styleClass="button"/>
+        <Label fx:id="msgLabel" text="" style="-fx-text-fill: #86efac; -fx-font-size: 12px;"/>
+    </HBox>
+</VBox>
