@@ -68,12 +68,25 @@ public class AccountService {
 
         Account account = new Account(null, code.trim(), name.trim(), sanitizedType, sanitizedSide, parentId, true, true);
         try (Connection conn = DbManager.get()) {
-            if (accountDao.findByCode(conn, code.trim()).isPresent()) {
-                throw new BusinessException("科目代碼已存在: " + code);
+            boolean originAutoCommit = conn.getAutoCommit();
+            conn.setAutoCommit(false);
+            try {
+                if (accountDao.findByCode(conn, code.trim()).isPresent()) {
+                    throw new BusinessException("科目代碼已存在: " + code);
+                }
+                Account created = accountDao.create(conn, account);
+                auditDao.log(conn, "CREATE_ACCOUNT", "accounts", created.id(), normOp, null, code + " " + name);
+                conn.commit();
+                return created;
+            } catch (Exception e) {
+                conn.rollback();
+                if (e instanceof BusinessException be) {
+                    throw be;
+                }
+                throw new BusinessException("新增科目失敗: " + e.getMessage(), e);
+            } finally {
+                conn.setAutoCommit(originAutoCommit);
             }
-            Account created = accountDao.create(conn, account);
-            auditDao.log(conn, "CREATE_ACCOUNT", "accounts", created.id(), normOp, null, code + " " + name);
-            return created;
         } catch (SQLException e) {
             throw new BusinessException("新增科目失敗: " + e.getMessage(), e);
         }
