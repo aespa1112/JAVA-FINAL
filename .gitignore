@@ -1,13 +1,13 @@
 # Maven target directory
 target/
 
-# Local databases and backups (exclude client and runtime databases)
-data/*.db
-data/client_*.db
-data/test_ledger*
-backup/*.db
+# Local databases and backups
+data/
+backup/
+*.db
 *.db-wal
 *.db-shm
+*.db-journal
 
 # IDE and Editor files
 .idea/
@@ -15,8 +15,14 @@ backup/*.db
 .classpath
 .project
 .settings/
+.vscode/
 
 # OS specific
 Thumbs.db
 Desktop.ini
 .DS_Store
+
+# Logs and temporary
+*.log
+*.tmp
+*.bak
