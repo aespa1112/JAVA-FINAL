@@ -8,7 +8,6 @@
       fx:controller="com.ledger.controller.MainController"
       prefHeight="760.0" prefWidth="1100.0" stylesheets="@../css/style.css">
 
-    <!-- 頂部帳套與操作員導航欄 -->
     <HBox styleClass="header-bar">
         <Label text="會計師專業記帳與審計軌跡系統" styleClass="app-title"/>
         <Region HBox.hgrow="ALWAYS"/>
@@ -27,9 +26,7 @@
         <Button text="登出" onAction="#onLogout" styleClass="button-danger"/>
     </HBox>
 
-    <!-- 核心功能模組分頁 -->
     <TabPane VBox.vgrow="ALWAYS" tabClosingPolicy="UNAVAILABLE">
-        <!-- Tab 1: 傳票錄入與管理 -->
         <Tab text="傳票錄入與過帳">
             <VBox spacing="10" style="-fx-padding: 12px;">
                 <HBox spacing="10" alignment="CENTER_LEFT">
@@ -154,6 +151,26 @@
                                 <TableColumn fx:id="colIsCode" text="代號" prefWidth="120"/>
                                 <TableColumn fx:id="colIsName" text="會計項目" prefWidth="280"/>
                                 <TableColumn fx:id="colIsAmount" text="本期金額" prefWidth="180" styleClass="money-cell"/>
+                            </columns>
+                        </TableView>
+                    </Tab>
+                    <Tab text="權益變動表">
+                        <TableView fx:id="eqTable">
+                            <columns>
+                                <TableColumn fx:id="colEqSection" text="報表分類" prefWidth="150"/>
+                                <TableColumn fx:id="colEqCode" text="代號" prefWidth="120"/>
+                                <TableColumn fx:id="colEqName" text="項目" prefWidth="280"/>
+                                <TableColumn fx:id="colEqAmount" text="金額" prefWidth="180" styleClass="money-cell"/>
+                            </columns>
+                        </TableView>
+                    </Tab>
+                    <Tab text="現金流量表">
+                        <TableView fx:id="cfTable">
+                            <columns>
+                                <TableColumn fx:id="colCfSection" text="活動分類" prefWidth="150"/>
+                                <TableColumn fx:id="colCfCode" text="代號" prefWidth="120"/>
+                                <TableColumn fx:id="colCfName" text="項目" prefWidth="300"/>
+                                <TableColumn fx:id="colCfAmount" text="金額" prefWidth="180" styleClass="money-cell"/>
                             </columns>
                         </TableView>
                     </Tab>
