@@ -72,7 +72,8 @@
                 </TableView>
             </VBox>
         </Tab>
-        <!-- Tab 2: 會計科目維護 -->
+
+        <!-- Tab 2: 會計科目管理 -->
         <Tab text="會計科目管理">
             <VBox spacing="10" style="-fx-padding: 12px;">
                 <HBox spacing="10" alignment="CENTER_LEFT">
@@ -180,6 +181,7 @@
                 </TabPane>
             </VBox>
         </Tab>
+
         <!-- Tab 5: FTS5 全文檢索 -->
         <Tab text="全文檢索 (FTS5)">
             <VBox spacing="10" style="-fx-padding: 12px;">
