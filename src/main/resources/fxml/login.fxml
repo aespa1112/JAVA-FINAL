@@ -6,7 +6,7 @@
 
 <VBox xmlns="http://javafx.com/javafx/21" xmlns:fx="http://javafx.com/fxml/1"
       fx:controller="com.ledger.controller.LoginController"
-      alignment="CENTER" spacing="16" prefWidth="420" prefHeight="480"
+      alignment="CENTER" spacing="16" prefWidth="420" prefHeight="500"
       stylesheets="@../css/style.css" style="-fx-background-color: #0f172a;">
 
     <padding>
@@ -14,14 +14,14 @@
     </padding>
 
     <Label text="會計師專業記帳系統" style="-fx-font-size: 22px; -fx-font-weight: bold; -fx-text-fill: #ffffff;"/>
-    <Label text="Professional Bookkeeping & Audit System"
-           style="-fx-font-size: 12px; -fx-text-fill: #94a3b8;"/>
+    <Label text="專業記帳與審計軌跡管理"
+           style="-fx-font-size: 13px; -fx-text-fill: #94a3b8;"/>
 
     <Region prefHeight="12"/>
 
     <VBox spacing="8" style="-fx-background-color: #1e293b; -fx-background-radius: 8; -fx-padding: 24;">
         <Label text="帳號" style="-fx-text-fill: #cbd5e1; -fx-font-size: 12px;"/>
-        <TextField fx:id="usernameField" promptText="請輸入帳號（如 amy）" prefWidth="280"
+        <TextField fx:id="usernameField" promptText="請輸入帳號" prefWidth="280"
                    onAction="#onLogin"/>
 
         <Label text="密碼" style="-fx-text-fill: #cbd5e1; -fx-font-size: 12px;"/>
@@ -30,17 +30,17 @@
 
         <Label fx:id="errorLabel" text="" style="-fx-text-fill: #f87171; -fx-font-size: 12px;"/>
 
-        <Button text="登 入" onAction="#onLogin" styleClass="button"
+        <Button text="登入" onAction="#onLogin" styleClass="button"
                 maxWidth="Infinity" prefHeight="36"/>
     </VBox>
 
     <Region prefHeight="8"/>
 
     <VBox spacing="4" alignment="CENTER">
-        <Label text="示範帳號（口試用）" style="-fx-text-fill: #64748b; -fx-font-size: 11px;"/>
-        <Label text="amy / amy123　　記帳員" style="-fx-text-fill: #94a3b8; -fx-font-size: 11px;"/>
-        <Label text="bob / bob123　　會計師" style="-fx-text-fill: #94a3b8; -fx-font-size: 11px;"/>
-        <Label text="david / david123　會計師" style="-fx-text-fill: #94a3b8; -fx-font-size: 11px;"/>
-        <Label text="charlie / charlie123　查帳員（唯讀）" style="-fx-text-fill: #94a3b8; -fx-font-size: 11px;"/>
+        <Label text="【示範帳號】" style="-fx-text-fill: #64748b; -fx-font-size: 11px; -fx-font-weight: bold;"/>
+        <Label text="amy　／　amy123　　→　記帳員（制單）" style="-fx-text-fill: #94a3b8; -fx-font-size: 11px;"/>
+        <Label text="bob　／　bob123　　→　會計師（審核）" style="-fx-text-fill: #94a3b8; -fx-font-size: 11px;"/>
+        <Label text="david　／　david123　→　會計師（審核）" style="-fx-text-fill: #94a3b8; -fx-font-size: 11px;"/>
+        <Label text="charlie　／　charlie123　→　查帳員（唯讀）" style="-fx-text-fill: #94a3b8; -fx-font-size: 11px;"/>
     </VBox>
 </VBox>
