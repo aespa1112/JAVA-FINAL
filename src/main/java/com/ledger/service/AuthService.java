@@ -3,7 +3,6 @@ package com.ledger.service;
 import com.ledger.exception.BusinessException;
 import com.ledger.model.OperatorRole;
 import java.nio.file.Files;
-import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.*;
 import java.util.ArrayList;
@@ -50,7 +49,6 @@ public class AuthService {
                 )
                 """);
 
-            // 種子帳號（僅在空白表時寫入）
             try (ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM users")) {
                 if (rs.next() && rs.getInt(1) == 0) {
                     seed(conn, "admin", "admin123", "Admin (系統管理員)", "ADMIN");
@@ -61,7 +59,6 @@ public class AuthService {
                 }
             }
 
-            // 將資料庫中所有啟用帳號註冊到 OperatorRole 白名單
             reloadRoleWhitelist(conn);
         } catch (SQLException e) {
             throw new BusinessException("初始化人員帳號資料庫失敗: " + e.getMessage(), e);
@@ -256,12 +253,9 @@ public class AuthService {
     }
 
     private void requireAdmin(String operator) {
-        if (!isAdmin(operator) && !isAdmin(OperatorRole.normalize(operator))) {
-            // normalize may throw; try direct
-            UserAccount acc = getAccount(operator);
-            if (acc == null || acc.role() != OperatorRole.ADMIN) {
-                throw new BusinessException("權限不足：僅系統管理員可管理人員帳號");
-            }
+        UserAccount acc = getAccount(operator);
+        if (acc == null || acc.role() != OperatorRole.ADMIN) {
+            throw new BusinessException("權限不足：僅系統管理員可管理人員帳號");
         }
     }
 
@@ -270,7 +264,7 @@ public class AuthService {
                 rs.getString("username"),
                 rs.getString("password"),
                 rs.getString("display_name"),
-                OperatorRole.valueOf(rs.getString("role")),
+                OperatorRole.valueOf(rs.getString("role"),
                 rs.getInt("enabled") == 1
         );
     }
