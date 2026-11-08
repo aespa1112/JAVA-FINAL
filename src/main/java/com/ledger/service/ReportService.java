@@ -1,6 +1,7 @@
 package com.ledger.service;
 
 import com.ledger.dao.ReportDao;
+import com.ledger.dao.ReportDaoExtra;
 import com.ledger.exception.BusinessException;
 import com.ledger.model.FinancialStatementItem;
 import com.ledger.model.GeneralLedgerItem;
@@ -19,6 +20,7 @@ import java.util.List;
 public class ReportService {
 
     private final ReportDao reportDao = new ReportDao();
+    private final ReportDaoExtra reportDaoExtra = new ReportDaoExtra();
 
     public List<TrialBalanceItem> getTrialBalance(String startDate, String endDate) {
         try {
@@ -59,11 +61,29 @@ public class ReportService {
         }
     }
 
+    /** 權益變動表 */
+    public List<FinancialStatementItem> getEquityChanges(String startDate, String endDate) {
+        try {
+            return reportDaoExtra.getEquityChanges(startDate, endDate);
+        } catch (SQLException e) {
+            throw new BusinessException("查詢權益變動表失敗: " + e.getMessage(), e);
+        }
+    }
+
+    /** 現金流量表（簡化間接法） */
+    public List<FinancialStatementItem> getCashFlow(String startDate, String endDate) {
+        try {
+            return reportDaoExtra.getCashFlow(startDate, endDate);
+        } catch (SQLException e) {
+            throw new BusinessException("查詢現金流量表失敗: " + e.getMessage(), e);
+        }
+    }
+
     private String escapeCsv(Object val) {
         if (val == null) return "\"\"";
         String s = String.valueOf(val);
         if (s.startsWith("=") || s.startsWith("+") || s.startsWith("-") || s.startsWith("@")) {
-            s = "\t" + s; // 消除 Excel 公式解析注入風險
+            s = "\t" + s;
         }
         return "\"" + s.replace("\"", "\"\"") + "\"";
     }
@@ -75,7 +95,7 @@ public class ReportService {
     public void exportTrialBalanceCsv(String startDate, String endDate, Path targetFile) throws IOException {
         List<TrialBalanceItem> items = getTrialBalance(startDate, endDate);
         try (BufferedWriter writer = Files.newBufferedWriter(targetFile, StandardCharsets.UTF_8)) {
-            writer.write('\ufeff'); // UTF-8 BOM
+            writer.write('\ufeff');
             writer.write("科目代號,科目名稱,科目類別,借貸性別,借方金額,貸方金額,淨餘額\n");
             for (TrialBalanceItem item : items) {
                 writer.write(String.format("%s,%s,%s,%s,%s,%s,%s\n",
