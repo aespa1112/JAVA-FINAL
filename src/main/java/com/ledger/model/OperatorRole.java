@@ -1,66 +1,59 @@
 package com.ledger.model;
 
 import com.ledger.exception.BusinessException;
-import java.util.Collections;
-import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * 系統使用者角色權限定義與安全映射：
- * MAKER: 記帳員 / 制單人（Amy）
- * CHECKER: 會計師 / 審核人（Bob, David - 雙人審核與紅字沖銷覆核）
- * AUDITOR: 查帳員 / 審計員（Charlie，唯讀）
- *
- * 安全設計說明：
- * 1. 嚴格白名單精確比對，杜絕模糊字串比對或泛用名稱繞過內控。
- * 2. 嚴格移除測試用與泛用名稱（如 checker, maker, auditor, bobchecker2），杜絕特權字串濫用。
- * 3. 提供 normalize() 方法將各處傳入的身分字串統一標準化為 "Amy", "Bob", "David", "Charlie"，
- *    確保傳票主檔欄位（preparer, reviewer）與審計日誌一致性。
- * 註：本系統以白名單模擬身分角色，生產環境建議對接 RBAC / 身分驗證系統。
+ * 系統使用者角色：
+ * ADMIN   — 系統管理員（可新增/停用人員帳號）
+ * MAKER   — 記帳員 / 制單人
+ * CHECKER — 會計師 / 審核人
+ * AUDITOR — 查帳員 / 審計員（唯讀）
  */
 public enum OperatorRole {
+    ADMIN,
     MAKER,
     CHECKER,
     AUDITOR;
 
-    private static final Map<String, OperatorRole> ROLE_MAP;
-    private static final Map<String, String> CANONICAL_NAMES;
+    private static final Map<String, OperatorRole> ROLE_MAP = new ConcurrentHashMap<>();
+    private static final Map<String, String> CANONICAL_NAMES = new ConcurrentHashMap<>();
 
     static {
-        Map<String, OperatorRole> rMap = new HashMap<>();
-        Map<String, String> cMap = new HashMap<>();
+        // 預設內建人員
+        registerInternal("admin", "Admin", ADMIN);
+        registerInternal("amy", "Amy", MAKER);
+        registerInternal("bob", "Bob", CHECKER);
+        registerInternal("david", "David", CHECKER);
+        registerInternal("charlie", "Charlie", AUDITOR);
+    }
 
-        // 1. 記帳員 / 制單人 (Amy)
-        rMap.put("amy", MAKER);
-        rMap.put("amy (記帳員/制單人)", MAKER);
-        cMap.put("amy", "Amy");
-        cMap.put("amy (記帳員/制單人)", "Amy");
-
-        // 2. 會計師 / 審核人 (Bob, David)
-        rMap.put("bob", CHECKER);
-        rMap.put("bob (會計師/審核人)", CHECKER);
-        cMap.put("bob", "Bob");
-        cMap.put("bob (會計師/審核人)", "Bob");
-
-        rMap.put("david", CHECKER);
-        rMap.put("david (會計師/審核人)", CHECKER);
-        cMap.put("david", "David");
-        cMap.put("david (會計師/審核人)", "David");
-
-        // 3. 查帳員 / 審計員 (Charlie)
-        rMap.put("charlie", AUDITOR);
-        rMap.put("charlie (查帳員/審計員)", AUDITOR);
-        cMap.put("charlie", "Charlie");
-        cMap.put("charlie (查帳員/審計員)", "Charlie");
-
-        ROLE_MAP = Collections.unmodifiableMap(rMap);
-        CANONICAL_NAMES = Collections.unmodifiableMap(cMap);
+    private static void registerInternal(String lowerKey, String canonical, OperatorRole role) {
+        ROLE_MAP.put(lowerKey, role);
+        CANONICAL_NAMES.put(lowerKey, canonical);
     }
 
     /**
-     * 規範化使用者名稱為標準系統名稱 ("Amy", "Bob", "David", "Charlie")。
-     * 若名稱為空或不在白名單內，嚴格拋出 BusinessException。
+     * 動態註冊新人員到角色白名單（由 AuthService 在載入/新增帳號時呼叫）。
      */
+    public static synchronized void register(String username, OperatorRole role) {
+        if (username == null || username.trim().isEmpty()) {
+            throw new BusinessException("使用者名稱不可為空");
+        }
+        if (role == null) {
+            throw new BusinessException("角色不可為空");
+        }
+        String key = username.trim().toLowerCase();
+        // 標準名稱：首字大寫
+        String canonical = username.trim().substring(0, 1).toUpperCase() + username.trim().substring(1).toLowerCase();
+        if (key.equals("admin")) {
+            canonical = "Admin";
+        }
+        ROLE_MAP.put(key, role);
+        CANONICAL_NAMES.put(key, canonical);
+    }
+
     public static String normalize(String operator) {
         if (operator == null || operator.trim().isEmpty()) {
             throw new BusinessException("使用者身分不可為空，拒絕操作！");
@@ -80,18 +73,15 @@ public enum OperatorRole {
         return canonical;
     }
 
-    /**
-     * 依據使用者名稱精確解析其角色。
-     * 若名稱為空或不在授權白名單內，嚴格拋出 BusinessException 以確保職責分離不被繞過。
-     */
     public static OperatorRole resolve(String operator) {
         String canonical = normalize(operator);
-        return ROLE_MAP.get(canonical.toLowerCase());
+        OperatorRole role = ROLE_MAP.get(canonical.toLowerCase());
+        if (role == null) {
+            throw new BusinessException("無法解析角色: " + operator);
+        }
+        return role;
     }
 
-    /**
-     * 查詢指定使用者是否在授權白名單內
-     */
     public static boolean isAuthorized(String operator) {
         if (operator == null || operator.trim().isEmpty()) return false;
         try {
@@ -100,5 +90,14 @@ public enum OperatorRole {
         } catch (BusinessException e) {
             return false;
         }
+    }
+
+    public String toChinese() {
+        return switch (this) {
+            case ADMIN -> "系統管理員";
+            case MAKER -> "記帳員/制單人";
+            case CHECKER -> "會計師/審核人";
+            case AUDITOR -> "查帳員/審計員";
+        };
     }
 }
