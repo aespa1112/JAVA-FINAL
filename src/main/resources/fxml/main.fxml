@@ -31,6 +31,7 @@
             <VBox spacing="10" style="-fx-padding: 12px;">
                 <HBox spacing="10" alignment="CENTER_LEFT">
                     <Button text="+ 新增傳票" onAction="#onNewVoucher" styleClass="button"/>
+                    <Button text="✎ 修改草稿" onAction="#onEditVoucher" styleClass="button-secondary"/>
                     <Button text="✔ 審核過帳" onAction="#onPostVoucher" styleClass="button-success"/>
                     <Button text="↩ 紅字沖銷" onAction="#onReverseVoucher" styleClass="button-warning"/>
                     <Button text="✖ 刪除草稿" onAction="#onDeleteVoucher" styleClass="button-danger"/>
@@ -42,7 +43,7 @@
                 </HBox>
 
                 <!-- 上方傳票清單 -->
-                <Label text="傳票主檔清單 (點選查看下方分錄明細)" style="-fx-font-weight: bold; -fx-text-fill: #334155;"/>
+                <Label text="傳票主檔清單 (點選查看下方分錄明細，雙擊草稿可編輯)" style="-fx-font-weight: bold; -fx-text-fill: #334155;"/>
                 <TableView fx:id="voucherTable" prefHeight="260" VBox.vgrow="ALWAYS">
                     <columns>
                         <TableColumn fx:id="colVoucherNo" text="傳票號碼" prefWidth="130"/>
