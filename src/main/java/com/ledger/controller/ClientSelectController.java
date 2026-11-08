@@ -36,7 +36,6 @@ public class ClientSelectController {
         clients.add("data/client_B.db");
         clients.add("data/client_C.db");
 
-        // 掃描 data 目錄既有 .db
         try {
             Path dataDir = Paths.get("data");
             if (Files.isDirectory(dataDir)) {
@@ -52,7 +51,6 @@ public class ClientSelectController {
                         });
             }
         } catch (Exception ignored) {
-            // 目錄不存在時略過
         }
 
         clientList.setItems(FXCollections.observableArrayList(clients));
@@ -79,7 +77,6 @@ public class ClientSelectController {
         if (!sanitized.endsWith(".db")) {
             sanitized += ".db";
         }
-        // 簡單檔名防護
         if (sanitized.contains("..") || sanitized.contains("/") || sanitized.contains("\\")) {
             errorLabel.setText("檔名不可包含路徑字元");
             return;
@@ -114,4 +111,23 @@ public class ClientSelectController {
             stage.setResizable(true);
             stage.centerOnScreen();
         } catch (Exception e) {
-            errorLabel.setText("開啟帳套失敗：
+            errorLabel.setText("開啟帳套失敗：" + e.getMessage());
+        }
+    }
+
+    @FXML
+    public void onLogout() {
+        SessionContext.clear();
+        try {
+            FXMLLoader loader = new FXMLLoader(getClass().getResource("/fxml/login.fxml"));
+            Parent root = loader.load();
+            Stage stage = (Stage) clientList.getScene().getWindow();
+            stage.setTitle("登入 — 會計師專業記帳系統");
+            stage.setScene(new Scene(root, 420, 500));
+            stage.setResizable(false);
+            stage.centerOnScreen();
+        } catch (Exception e) {
+            errorLabel.setText("返回登入失敗：" + e.getMessage());
+        }
+    }
+}
