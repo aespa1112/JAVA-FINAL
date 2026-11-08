@@ -39,15 +39,15 @@ public class AuthService {
 
     private void ensureSchemaAndSeed() {
         try (Connection conn = open(); Statement st = conn.createStatement()) {
-            st.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    username     TEXT PRIMARY KEY,
-                    password     TEXT NOT NULL,
-                    display_name TEXT NOT NULL,
-                    role         TEXT NOT NULL CHECK (role IN ('ADMIN','MAKER','CHECKER','AUDITOR')),
-                    enabled      INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1))
-                )
-                """);
+            st.execute(
+                "CREATE TABLE IF NOT EXISTS users (" +
+                "username TEXT PRIMARY KEY, " +
+                "password TEXT NOT NULL, " +
+                "display_name TEXT NOT NULL, " +
+                "role TEXT NOT NULL CHECK (role IN ('ADMIN','MAKER','CHECKER','AUDITOR')), " +
+                "enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1))" +
+                ")"
+            );
 
             try (ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM users")) {
                 if (rs.next() && rs.getInt(1) == 0) {
@@ -264,7 +264,7 @@ public class AuthService {
                 rs.getString("username"),
                 rs.getString("password"),
                 rs.getString("display_name"),
-                OperatorRole.valueOf(rs.getString("role"),
+                OperatorRole.valueOf(rs.getString("role")),
                 rs.getInt("enabled") == 1
         );
     }
