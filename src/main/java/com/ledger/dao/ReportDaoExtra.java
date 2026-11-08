@@ -8,14 +8,9 @@ import java.util.List;
 
 /**
  * 補充報表：權益變動表、現金流量表（教學用簡化間接法）。
- * 與 ReportDao 分離，方便逐步整合至主畫面。
  */
 public class ReportDaoExtra {
 
-    /**
-     * 權益變動表（簡化）：
-     * 期初權益 → 本期淨利 → 業主投入／分配（股本、資本公積變動）→ 期末權益
-     */
     public List<FinancialStatementItem> getEquityChanges(String startDate, String endDate) throws SQLException {
         try (Connection conn = DbManager.get()) {
             return getEquityChanges(conn, startDate, endDate);
@@ -27,10 +22,9 @@ public class ReportDaoExtra {
 
         long beginEquity = equityBalanceBefore(conn, startDate);
         long periodNetIncome = periodNetIncome(conn, startDate, endDate);
-        long capitalInject = equityAccountMovement(conn, startDate, endDate, "3101"); // 普通股股本淨增加
-        long capitalSurplus = equityAccountMovement(conn, startDate, endDate, "3201"); // 資本公積
-        // 保留盈餘科目本身的直接變動（不含本期損益虛擬結轉）
-        long retainedDirect = equityAccountMovement(conn, startDate, endDate, "3301");
+        long capitalInject = accountNetChange(conn, startDate, endDate, "3101");
+        long capitalSurplus = accountNetChange(conn, startDate, endDate, "3201");
+        long retainedDirect = accountNetChange(conn, startDate, endDate, "3301");
 
         long endEquity = beginEquity + periodNetIncome + capitalInject + capitalSurplus + retainedDirect;
 
@@ -43,13 +37,6 @@ public class ReportDaoExtra {
         return list;
     }
 
-    /**
-     * 現金流量表（簡化間接法）：
-     * 營業活動 = 本期淨利 + 營運資金額度變動（應收、存貨、應付等）
-     * 投資活動 = 不動產廠房設備等非流動資產變動（以支出為負）
-     * 籌資活動 = 借款、股本等變動
-     * 再加期初現金核對期末現金
-     */
     public List<FinancialStatementItem> getCashFlow(String startDate, String endDate) throws SQLException {
         try (Connection conn = DbManager.get()) {
             return getCashFlow(conn, startDate, endDate);
@@ -61,22 +48,19 @@ public class ReportDaoExtra {
 
         long ni = periodNetIncome(conn, startDate, endDate);
 
-        // 營運資金變動：資產增加→現金減少；負債增加→現金增加
-        long dAr = -accountNetChange(conn, startDate, endDate, "1122"); // 應收帳款
-        long dPrepay = -accountNetChange(conn, startDate, endDate, "1141");
-        long dInv = -accountNetChange(conn, startDate, endDate, "1201");
-        long dAp = accountNetChange(conn, startDate, endDate, "2122");  // 應付帳款
+        long dAr = -accountDebitNetChange(conn, startDate, endDate, "1122");
+        long dPrepay = -accountDebitNetChange(conn, startDate, endDate, "1141");
+        long dInv = -accountDebitNetChange(conn, startDate, endDate, "1201");
+        long dAp = accountNetChange(conn, startDate, endDate, "2122");
         long dNp = accountNetChange(conn, startDate, endDate, "2121");
         long dSal = accountNetChange(conn, startDate, endDate, "2124");
         long dTax = accountNetChange(conn, startDate, endDate, "2125");
 
         long operating = ni + dAr + dPrepay + dInv + dAp + dNp + dSal + dTax;
 
-        // 投資：PPE 增加視為購置（現金流出）
-        long dPpe = -accountNetChange(conn, startDate, endDate, "1401");
+        long dPpe = -accountDebitNetChange(conn, startDate, endDate, "1401");
         long investing = dPpe;
 
-        // 籌資：借款、股本增加為流入
         long dLoan = accountNetChange(conn, startDate, endDate, "2101");
         long dCap = accountNetChange(conn, startDate, endDate, "3101");
         long dSur = accountNetChange(conn, startDate, endDate, "3201");
@@ -98,8 +82,6 @@ public class ReportDaoExtra {
         list.add(new FinancialStatementItem("合計", "ACTUAL_CASH", "期末現金及約當現金（帳列）", actualEndCash));
         return list;
     }
-
-    // ---------- helpers ----------
 
     private long periodNetIncome(Connection conn, String start, String end) throws SQLException {
         StringBuilder sql = new StringBuilder(
@@ -126,7 +108,6 @@ public class ReportDaoExtra {
     }
 
     private long equityBalanceBefore(Connection conn, String startDate) throws SQLException {
-        // 權益科目 + 損益科目在 startDate 之前的淨額（credit - debit 對權益/收入；費用相反）
         String sql =
                 "SELECT a.type, COALESCE(SUM(e.debit_minor),0) d, COALESCE(SUM(e.credit_minor),0) c " +
                 "FROM accounts a LEFT JOIN (" +
@@ -149,12 +130,19 @@ public class ReportDaoExtra {
         return total;
     }
 
-    private long equityAccountMovement(Connection conn, String start, String end, String code) throws SQLException {
-        return accountNetChange(conn, start, end, code);
+    /** 負債／權益：credit - debit */
+    private long accountNetChange(Connection conn, String start, String end, String code) throws SQLException {
+        long[] dc = sumDebitCredit(conn, start, end, code);
+        return dc[1] - dc[0];
     }
 
-    /** 期間內該科目淨變動（credit - debit）；資產科目若要用借方增加需呼叫端自行取負 */
-    private long accountNetChange(Connection conn, String start, String end, String code) throws SQLException {
+    /** 資產：debit - credit（期間淨增加） */
+    private long accountDebitNetChange(Connection conn, String start, String end, String code) throws SQLException {
+        long[] dc = sumDebitCredit(conn, start, end, code);
+        return dc[0] - dc[1];
+    }
+
+    private long[] sumDebitCredit(Connection conn, String start, String end, String code) throws SQLException {
         StringBuilder sql = new StringBuilder(
                 "SELECT COALESCE(SUM(e.debit_minor),0), COALESCE(SUM(e.credit_minor),0) " +
                 "FROM voucher_entries e JOIN vouchers v ON v.id=e.voucher_id JOIN accounts a ON a.id=e.account_id " +
@@ -168,20 +156,30 @@ public class ReportDaoExtra {
         try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
             for (int i = 0; i < params.size(); i++) ps.setString(i + 1, params.get(i));
             try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    return rs.getLong(2) - rs.getLong(1); // credit - debit
-                }
+                if (rs.next()) return new long[]{rs.getLong(1), rs.getLong(2)};
             }
         }
-        return 0;
+        return new long[]{0, 0};
     }
 
     private long cashBalanceBefore(Connection conn, String start) throws SQLException {
-        return cashBalanceAsOf(conn, start == null ? null : minusOneDayHint(start));
+        StringBuilder sql = new StringBuilder(
+                "SELECT COALESCE(SUM(e.debit_minor - e.credit_minor),0) " +
+                "FROM voucher_entries e JOIN vouchers v ON v.id=e.voucher_id JOIN accounts a ON a.id=e.account_id " +
+                "WHERE v.status='POSTED' AND a.code IN ('1101','1102')"
+        );
+        if (start != null && !start.isBlank()) {
+            sql.append(" AND v.voucher_date < ?");
+        }
+        try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
+            if (start != null && !start.isBlank()) ps.setString(1, start.trim());
+            try (ResultSet rs = ps.executeQuery()) {
+                return rs.next() ? rs.getLong(1) : 0;
+            }
+        }
     }
 
     private long cashBalanceAsOf(Connection conn, String asOf) throws SQLException {
-        // 1101 庫存現金 + 1102 銀行存款，資產：debit - credit
         StringBuilder sql = new StringBuilder(
                 "SELECT COALESCE(SUM(e.debit_minor - e.credit_minor),0) " +
                 "FROM voucher_entries e JOIN vouchers v ON v.id=e.voucher_id JOIN accounts a ON a.id=e.account_id " +
@@ -196,11 +194,5 @@ public class ReportDaoExtra {
                 return rs.next() ? rs.getLong(1) : 0;
             }
         }
-    }
-
-    private String minusOneDayHint(String date) {
-        // 簡化：直接用 < startDate 語意時傳 startDate 給 before 查詢即可；此處回傳 start 供 <= 使用時請改用 before
-        // cashBalanceBefore 改用專用 SQL
-        return date;
     }
 }
