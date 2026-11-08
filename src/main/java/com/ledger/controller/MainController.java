@@ -142,6 +142,7 @@ public class MainController {
     private ClosingService closingService;
     private BackupService backupService;
     private ReportService reportService;
+    private AttachmentService attachmentService;
     private FtsDao ftsDao;
     @FXML
     public void initialize() {
@@ -153,6 +154,7 @@ public class MainController {
         closingService = new ClosingService(periodDao, auditDao);
         backupService = new BackupService();
         reportService = new ReportService();
+        attachmentService = new AttachmentService();
         ftsDao = new FtsDao();
 
         initClientAndOperator();
@@ -969,6 +971,88 @@ public class MainController {
             stage.centerOnScreen();
         } catch (Exception e) {
             showError("切換帳套畫面失敗", e.getMessage());
+        }
+    }
+
+
+    @FXML
+    public void onManageAttachments() {
+        Voucher selected = voucherTable.getSelectionModel().getSelectedItem();
+        if (selected == null) {
+            showWarn("請先選取", "請先選擇一張傳票再管理原始憑證。");
+            return;
+        }
+        try {
+            var list = attachmentService.listByVoucher(selected.id());
+            StringBuilder sb = new StringBuilder();
+            sb.append("傳票 ").append(selected.voucherNo()).append(" 的原始憑證附件\n\n");
+            if (list.isEmpty()) {
+                sb.append("（尚無附件）\n");
+            } else {
+                for (var a : list) {
+                    sb.append("#").append(a.id()).append("  ")
+                      .append(a.fileName()).append("  (")
+                      .append(a.fileSize()).append(" bytes)  ")
+                      .append(a.uploadedBy()).append("  ")
+                      .append(a.uploadedAt()).append("\n");
+                }
+            }
+            sb.append("\n請選擇操作：");
+
+            Alert alert = new Alert(Alert.AlertType.CONFIRMATION);
+            alert.setTitle("原始憑證");
+            alert.setHeaderText(sb.toString());
+            ButtonType upload = new ButtonType("上傳附件");
+            ButtonType openDir = new ButtonType("開啟資料夾");
+            ButtonType del = new ButtonType("刪除所選附件");
+            ButtonType cancel = new ButtonType("關閉", ButtonBar.ButtonData.CANCEL_CLOSE);
+            alert.getButtonTypes().setAll(upload, openDir, del, cancel);
+
+            var result = alert.showAndWait();
+            if (result.isEmpty() || result.get() == cancel) return;
+
+            if (result.get() == upload) {
+                FileChooser chooser = new FileChooser();
+                chooser.setTitle("選擇原始憑證檔案（PDF / 圖片）");
+                chooser.getExtensionFilters().addAll(
+                        new FileChooser.ExtensionFilter("文件與圖片", "*.pdf", "*.png", "*.jpg", "*.jpeg", "*.gif"),
+                        new FileChooser.ExtensionFilter("所有檔案", "*.*")
+                );
+                File file = chooser.showOpenDialog(statusLabel.getScene().getWindow());
+                if (file != null) {
+                    attachmentService.addAttachment(selected.id(), file.toPath(), null, getSelectedOperator());
+                    showInfo("上傳成功", "已掛載原始憑證：\n" + file.getName());
+                    statusLabel.setText("已上傳原始憑證至傳票 " + selected.voucherNo());
+                }
+            } else if (result.get() == openDir) {
+                Path dir = Paths.get("attachments");
+                if (!Files.exists(dir)) Files.createDirectories(dir);
+                if (java.awt.Desktop.isDesktopSupported()) {
+                    java.awt.Desktop.getDesktop().open(dir.toFile());
+                } else {
+                    showInfo("附件目錄", dir.toAbsolutePath().toString());
+                }
+            } else if (result.get() == del) {
+                if (list.isEmpty()) {
+                    showWarn("無附件", "此傳票尚無附件可刪除。");
+                    return;
+                }
+                TextInputDialog dialog = new TextInputDialog();
+                dialog.setTitle("刪除附件");
+                dialog.setHeaderText("請輸入要刪除的附件編號（id）");
+                dialog.setContentText("附件 ID:");
+                dialog.showAndWait().ifPresent(idStr -> {
+                    try {
+                        long id = Long.parseLong(idStr.trim());
+                        attachmentService.deleteAttachment(id, getSelectedOperator());
+                        showInfo("已刪除", "附件 #" + id + " 已刪除");
+                    } catch (Exception ex) {
+                        showError("刪除失敗", ex.getMessage());
+                    }
+                });
+            }
+        } catch (Exception e) {
+            showError("原始憑證操作失敗", e.getMessage());
         }
     }
 
