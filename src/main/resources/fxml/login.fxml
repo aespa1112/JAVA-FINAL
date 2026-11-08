@@ -6,18 +6,18 @@
 
 <VBox xmlns="http://javafx.com/javafx/21" xmlns:fx="http://javafx.com/fxml/1"
       fx:controller="com.ledger.controller.LoginController"
-      alignment="CENTER" spacing="16" prefWidth="420" prefHeight="500"
+      alignment="CENTER" spacing="14" prefWidth="420" prefHeight="540"
       stylesheets="@../css/style.css" style="-fx-background-color: #0f172a;">
 
     <padding>
-        <Insets top="40" right="40" bottom="40" left="40"/>
+        <Insets top="36" right="40" bottom="36" left="40"/>
     </padding>
 
     <Label text="會計師專業記帳系統" style="-fx-font-size: 22px; -fx-font-weight: bold; -fx-text-fill: #ffffff;"/>
     <Label text="專業記帳與審計軌跡管理"
            style="-fx-font-size: 13px; -fx-text-fill: #94a3b8;"/>
 
-    <Region prefHeight="12"/>
+    <Region prefHeight="10"/>
 
     <VBox spacing="8" style="-fx-background-color: #1e293b; -fx-background-radius: 8; -fx-padding: 24;">
         <Label text="帳號" style="-fx-text-fill: #cbd5e1; -fx-font-size: 12px;"/>
@@ -34,10 +34,11 @@
                 maxWidth="Infinity" prefHeight="36"/>
     </VBox>
 
-    <Region prefHeight="8"/>
+    <Region prefHeight="6"/>
 
-    <VBox spacing="4" alignment="CENTER">
+    <VBox spacing="3" alignment="CENTER">
         <Label text="【示範帳號】" style="-fx-text-fill: #64748b; -fx-font-size: 11px; -fx-font-weight: bold;"/>
+        <Label text="admin　／　admin123　→　系統管理員" style="-fx-text-fill: #fbbf24; -fx-font-size: 11px;"/>
         <Label text="amy　／　amy123　　→　記帳員（制單）" style="-fx-text-fill: #94a3b8; -fx-font-size: 11px;"/>
         <Label text="bob　／　bob123　　→　會計師（審核）" style="-fx-text-fill: #94a3b8; -fx-font-size: 11px;"/>
         <Label text="david　／　david123　→　會計師（審核）" style="-fx-text-fill: #94a3b8; -fx-font-size: 11px;"/>
