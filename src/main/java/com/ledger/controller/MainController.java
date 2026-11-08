@@ -91,6 +91,18 @@ public class MainController {
     @FXML private TableColumn<FinancialStatementItem, String> colIsName;
     @FXML private TableColumn<FinancialStatementItem, String> colIsAmount;
 
+    @FXML private TableView<FinancialStatementItem> eqTable;
+    @FXML private TableColumn<FinancialStatementItem, String> colEqSection;
+    @FXML private TableColumn<FinancialStatementItem, String> colEqCode;
+    @FXML private TableColumn<FinancialStatementItem, String> colEqName;
+    @FXML private TableColumn<FinancialStatementItem, String> colEqAmount;
+
+    @FXML private TableView<FinancialStatementItem> cfTable;
+    @FXML private TableColumn<FinancialStatementItem, String> colCfSection;
+    @FXML private TableColumn<FinancialStatementItem, String> colCfCode;
+    @FXML private TableColumn<FinancialStatementItem, String> colCfName;
+    @FXML private TableColumn<FinancialStatementItem, String> colCfAmount;
+
     @FXML private ComboBox<Account> glAccountCombo;
     @FXML private TableView<GeneralLedgerItem> glTable;
     @FXML private TableColumn<GeneralLedgerItem, String> colGlDate;
@@ -355,6 +367,16 @@ public class MainController {
         colIsCode.setCellValueFactory(d -> new SimpleStringProperty(d.getValue().code()));
         colIsName.setCellValueFactory(d -> new SimpleStringProperty(d.getValue().name()));
         colIsAmount.setCellValueFactory(d -> new SimpleStringProperty(MoneyUtil.format(d.getValue().amountMinor())));
+
+        colEqSection.setCellValueFactory(d -> new SimpleStringProperty(d.getValue().section()));
+        colEqCode.setCellValueFactory(d -> new SimpleStringProperty(d.getValue().code()));
+        colEqName.setCellValueFactory(d -> new SimpleStringProperty(d.getValue().name()));
+        colEqAmount.setCellValueFactory(d -> new SimpleStringProperty(MoneyUtil.format(d.getValue().amountMinor())));
+
+        colCfSection.setCellValueFactory(d -> new SimpleStringProperty(d.getValue().section()));
+        colCfCode.setCellValueFactory(d -> new SimpleStringProperty(d.getValue().code()));
+        colCfName.setCellValueFactory(d -> new SimpleStringProperty(d.getValue().name()));
+        colCfAmount.setCellValueFactory(d -> new SimpleStringProperty(MoneyUtil.format(d.getValue().amountMinor())));
 
         colGlDate.setCellValueFactory(d -> new SimpleStringProperty(d.getValue().voucherDate()));
         colGlVoucherNo.setCellValueFactory(d -> new SimpleStringProperty(d.getValue().voucherNo()));
@@ -863,6 +885,8 @@ public class MainController {
         tbTable.setItems(FXCollections.observableArrayList(reportService.getTrialBalance(startDate, endDate)));
         bsTable.setItems(FXCollections.observableArrayList(reportService.getBalanceSheet(endDate)));
         isTable.setItems(FXCollections.observableArrayList(reportService.getIncomeStatement(startDate, endDate)));
+        eqTable.setItems(FXCollections.observableArrayList(reportService.getEquityChanges(startDate, endDate)));
+        cfTable.setItems(FXCollections.observableArrayList(reportService.getCashFlow(startDate, endDate)));
 
         Account glAcc = glAccountCombo.getValue();
         if (glAcc != null) {
