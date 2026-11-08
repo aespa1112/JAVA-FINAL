@@ -11,11 +11,11 @@ public class App extends Application {
 
     @Override
     public void start(Stage primaryStage) throws Exception {
-        // 啟動時進入登入畫面（不再直接進入主系統）
+        // 啟動時進入登入畫面
         FXMLLoader loader = new FXMLLoader(getClass().getResource("/fxml/login.fxml"));
         Parent root = loader.load();
 
-        Scene scene = new Scene(root, 420, 480);
+        Scene scene = new Scene(root, 420, 500);
         primaryStage.setTitle("登入 — 會計師專業記帳系統");
         primaryStage.setScene(scene);
         primaryStage.setResizable(false);
