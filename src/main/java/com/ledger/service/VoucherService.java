@@ -92,10 +92,17 @@ public class VoucherService {
             throw new BusinessException("職責分離原則：會計師（審核人 " + normPreparer + "）不得兼任制單人建立一般傳票");
         }
 
-        return createDraftInternal(voucherDate, summary, reversedId, normPreparer, entries);
+        return createDraftInternal(voucherDate, summary, reversedId, normPreparer, entries, null, null);
     }
 
-    private Voucher createDraftInternal(String voucherDate, String summary, Long reversedId, String preparer, List<VoucherEntry> entries) {
+    /**
+     * 內部建立草稿。
+     * @param reverseInitiator 若為紅字沖銷，傳入發起人標準名稱，會在同一交易中寫入 REVERSE_INITIATED 日誌。
+     * @param originVoucherNo  原傳票編號（僅用於審計日誌說明）。
+     */
+    private Voucher createDraftInternal(String voucherDate, String summary, Long reversedId,
+                                        String preparer, List<VoucherEntry> entries,
+                                        String reverseInitiator, String originVoucherNo) {
         if (preparer == null || preparer.trim().isEmpty()) {
             throw new BusinessException("制單人不可為空");
         }
@@ -142,6 +149,16 @@ public class VoucherService {
                 Voucher created = voucherDao.create(conn, draft, entries);
                 auditDao.log(conn, "CREATE_DRAFT", "vouchers", created.id(), preparer, null, "VoucherNo: " + voucherNo);
 
+                // 紅字沖銷：在同一交易中寫入發起紀錄，確保草稿與審計日誌原子性
+                if (reversedId != null && reverseInitiator != null && !reverseInitiator.isBlank()) {
+                    String detail = "Created Draft: " + voucherNo;
+                    if (originVoucherNo != null && !originVoucherNo.isBlank()) {
+                        detail = "Origin: " + originVoucherNo + " | " + detail;
+                    }
+                    auditDao.log(conn, "REVERSE_INITIATED", "vouchers", created.id(),
+                            reverseInitiator, originVoucherNo, detail);
+                }
+
                 conn.commit();
                 return created;
             } catch (Exception e) {
@@ -187,21 +204,33 @@ public class VoucherService {
                                     voucher.preparer(), normReviewer));
                 }
 
-                // 針對紅字沖銷傳票執行雙人審核控制：沖銷發起人不得兼任審核人自行過帳
+                // 針對紅字沖銷傳票執行雙人審核控制（Fail-Closed）
                 if (voucher.reversedId() != null) {
-                    String checkInitiatorSql = "SELECT operator FROM audit_log WHERE action = 'REVERSE_INITIATED' AND (record_id = ? OR record_id = ?) ORDER BY id DESC LIMIT 1";
+                    String checkInitiatorSql =
+                            "SELECT operator FROM audit_log " +
+                            "WHERE action = 'REVERSE_INITIATED' AND (record_id = ? OR record_id = ?) " +
+                            "ORDER BY id DESC LIMIT 1";
+                    String initiator = null;
                     try (PreparedStatement ps = conn.prepareStatement(checkInitiatorSql)) {
                         ps.setLong(1, voucherId);
                         ps.setLong(2, voucher.reversedId());
                         try (ResultSet rs = ps.executeQuery()) {
                             if (rs.next()) {
-                                String initiator = rs.getString(1);
-                                if (initiator != null && initiator.equalsIgnoreCase(normReviewer)) {
-                                    throw new BusinessException(
-                                            String.format("職責分離原則：紅字沖銷發起人（%s）不得自行審核過帳該沖銷傳票，必須由第二位會計師審核！", initiator));
-                                }
+                                initiator = rs.getString(1);
                             }
                         }
+                    }
+
+                    // Fail-Closed：缺少發起紀錄時拒絕過帳，防止雙人審核被繞過
+                    if (initiator == null || initiator.isBlank()) {
+                        throw new BusinessException(
+                                "紅字沖銷傳票缺少 REVERSE_INITIATED 發起紀錄，無法過帳。請重新發起沖銷以確保雙人審核可追蹤！");
+                    }
+
+                    if (initiator.equalsIgnoreCase(normReviewer)) {
+                        throw new BusinessException(
+                                String.format("職責分離原則：紅字沖銷發起人（%s）不得自行審核過帳該沖銷傳票，必須由第二位會計師審核！",
+                                        initiator));
                     }
                 }
 
@@ -284,9 +313,9 @@ public class VoucherService {
                     ? OperatorRole.normalize(origin.preparer())
                     : "Amy";
 
-            Voucher draft = createDraftInternal(today, summary, originId, preparer, reversedEntries);
-            auditDao.log(conn, "REVERSE_INITIATED", "vouchers", draft.id(), normOp, origin.voucherNo(), "Created Draft: " + draft.voucherNo());
-            return draft;
+            // 在同一交易中建立草稿並寫入 REVERSE_INITIATED，確保原子性
+            return createDraftInternal(today, summary, originId, preparer, reversedEntries,
+                    normOp, origin.voucherNo());
         } catch (SQLException e) {
             throw new BusinessException("沖銷操作異常: " + e.getMessage(), e);
         }
