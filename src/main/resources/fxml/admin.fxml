@@ -11,11 +11,12 @@
 
     <Label text="系統管理員 — 人員帳號管理" style="-fx-font-size: 20px; -fx-font-weight: bold; -fx-text-fill: #ffffff;"/>
     <Label fx:id="adminLabel" text="" style="-fx-text-fill: #94a3b8; -fx-font-size: 12px;"/>
+    <Label text="管理員僅可查詢、新增、啟用／停用與重設密碼，不可進入會計記帳系統。"
+           style="-fx-text-fill: #fbbf24; -fx-font-size: 12px;"/>
 
     <HBox spacing="10" alignment="CENTER_LEFT">
         <Button text="重新整理" onAction="#onRefresh" styleClass="button-secondary"/>
         <Region HBox.hgrow="ALWAYS"/>
-        <Button text="進入會計系統" onAction="#onEnterSystem" styleClass="button-success"/>
         <Button text="登出" onAction="#onLogout" styleClass="button-danger"/>
     </HBox>
 
