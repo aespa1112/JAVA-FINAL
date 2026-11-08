@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<?import javafx.geometry.Insets?>
+<?import javafx.scene.control.*?>
+<?import javafx.scene.layout.*?>
+
+<VBox xmlns="http://javafx.com/javafx/21" xmlns:fx="http://javafx.com/fxml/1"
+      fx:controller="com.ledger.controller.ClientSelectController"
+      alignment="CENTER" spacing="14" prefWidth="480" prefHeight="420"
+      stylesheets="@../css/style.css" style="-fx-background-color: #0f172a;">
+
+    <padding>
+        <Insets top="32" right="36" bottom="32" left="36"/>
+    </padding>
+
+    <Label text="選擇客戶帳套" style="-fx-font-size: 20px; -fx-font-weight: bold; -fx-text-fill: #ffffff;"/>
+    <Label fx:id="userLabel" text="目前登入: —" style="-fx-font-size: 12px; -fx-text-fill: #94a3b8;"/>
+
+    <Region prefHeight="8"/>
+
+    <VBox spacing="10" style="-fx-background-color: #1e293b; -fx-background-radius: 8; -fx-padding: 20;">
+        <Label text="請選擇要進入的客戶帳套" style="-fx-text-fill: #cbd5e1; -fx-font-size: 12px;"/>
+        <ListView fx:id="clientList" prefHeight="160" prefWidth="360"/>
+
+        <HBox spacing="8">
+            <TextField fx:id="newClientField" promptText="新增帳套檔名（如 client_D.db）" HBox.hgrow="ALWAYS"/>
+            <Button text="+ 新增" onAction="#onAddClient" styleClass="button-secondary"/>
+        </HBox>
+
+        <Label fx:id="errorLabel" text="" style="-fx-text-fill: #f87171; -fx-font-size: 12px;"/>
+
+        <Button text="進入會計系統" onAction="#onEnter" styleClass="button"
+                maxWidth="Infinity" prefHeight="36"/>
+        <Button text="登出" onAction="#onLogout" styleClass="button-secondary"
+                maxWidth="Infinity"/>
+    </VBox>
+</VBox>
