@@ -35,6 +35,7 @@
                     <Button text="✔ 審核過帳" onAction="#onPostVoucher" styleClass="button-success"/>
                     <Button text="↩ 紅字沖銷" onAction="#onReverseVoucher" styleClass="button-warning"/>
                     <Button text="✖ 刪除草稿" onAction="#onDeleteVoucher" styleClass="button-danger"/>
+                    <Button text="📎 原始憑證" onAction="#onManageAttachments" styleClass="button-secondary"/>
                     <Region HBox.hgrow="ALWAYS"/>
                     <Label text="狀態:"/>
                     <ComboBox fx:id="voucherStatusFilter" prefWidth="110"/>
