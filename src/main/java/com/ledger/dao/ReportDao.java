@@ -85,6 +85,34 @@ public class ReportDao {
             }
         }
 
+        // ---------- 計算期初餘額（startDate 之前已過帳分錄的淨額）----------
+        long openingBalance = 0;
+        boolean hasStartDate = startDate != null && !startDate.trim().isEmpty();
+        if (hasStartDate) {
+            String openingSql =
+                    "SELECT COALESCE(SUM(e.debit_minor), 0) AS total_debit, " +
+                    "       COALESCE(SUM(e.credit_minor), 0) AS total_credit " +
+                    "FROM voucher_entries e " +
+                    "JOIN vouchers v ON v.id = e.voucher_id " +
+                    "WHERE e.account_id = ? AND v.status = 'POSTED' AND v.voucher_date < ?";
+            try (PreparedStatement ps = conn.prepareStatement(openingSql)) {
+                ps.setLong(1, accountId);
+                ps.setString(2, startDate.trim());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        long debit = rs.getLong("total_debit");
+                        long credit = rs.getLong("total_credit");
+                        if ("DEBIT".equalsIgnoreCase(normalSide)) {
+                            openingBalance = debit - credit;
+                        } else {
+                            openingBalance = credit - debit;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---------- 查詢期間內明細 ----------
         StringBuilder sql = new StringBuilder(
                 "SELECT v.voucher_date, v.voucher_no, v.summary, e.line_no, e.memo, e.debit_minor, e.credit_minor " +
                 "FROM voucher_entries e " +
@@ -94,7 +122,7 @@ public class ReportDao {
         List<Object> params = new ArrayList<>();
         params.add(accountId);
 
-        if (startDate != null && !startDate.trim().isEmpty()) {
+        if (hasStartDate) {
             sql.append(" AND v.voucher_date >= ? ");
             params.add(startDate.trim());
         }
@@ -105,7 +133,22 @@ public class ReportDao {
         sql.append(" ORDER BY v.voucher_date ASC, v.voucher_no ASC, e.line_no ASC");
 
         List<GeneralLedgerItem> list = new ArrayList<>();
-        long runningBalance = 0;
+        long runningBalance = openingBalance;
+
+        // 有期初餘額時，在最前方插入「期初餘額」列，方便閱讀與 CSV 匯出
+        if (hasStartDate) {
+            list.add(new GeneralLedgerItem(
+                    startDate.trim(),
+                    "—",
+                    "期初餘額",
+                    0,
+                    "",
+                    0L,
+                    0L,
+                    openingBalance
+            ));
+        }
+
         try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
             for (int i = 0; i < params.size(); i++) {
                 ps.setObject(i + 1, params.get(i));
