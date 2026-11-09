@@ -194,28 +194,20 @@ public class MainController {
             }
         });
 
-        // 操作員預設為登入使用者；仍可切換以方便口試示範職責分離
-        operatorCombo.setItems(FXCollections.observableArrayList(
-                "Amy (記帳員/制單人)",
-                "Bob (會計師/審核人)",
-                "David (會計師/審核人)",
-                "Charlie (查帳員/審計員)"
-        ));
+        // 操作員強制綁定登入 Session，禁止 UI 切換身分（修復職責分離破口）
         String loginDisplay = SessionContext.getUserDisplay();
-        if (loginDisplay != null && operatorCombo.getItems().contains(loginDisplay)) {
-            operatorCombo.setValue(loginDisplay);
+        String user = SessionContext.getUser();
+        String lockedLabel;
+        if (loginDisplay != null && !loginDisplay.isBlank()) {
+            lockedLabel = loginDisplay;
+        } else if (user != null) {
+            lockedLabel = user;
         } else {
-            String user = SessionContext.getUser();
-            if ("Bob".equalsIgnoreCase(user)) {
-                operatorCombo.setValue("Bob (會計師/審核人)");
-            } else if ("David".equalsIgnoreCase(user)) {
-                operatorCombo.setValue("David (會計師/審核人)");
-            } else if ("Charlie".equalsIgnoreCase(user)) {
-                operatorCombo.setValue("Charlie (查帳員/審計員)");
-            } else {
-                operatorCombo.setValue("Amy (記帳員/制單人)");
-            }
+            lockedLabel = "Unknown";
         }
+        operatorCombo.setItems(FXCollections.observableArrayList(lockedLabel));
+        operatorCombo.setValue(lockedLabel);
+        operatorCombo.setDisable(true);
 
         voucherStatusFilter.setItems(FXCollections.observableArrayList("ALL", "DRAFT", "POSTED", "VOID"));
         voucherStatusFilter.setValue("ALL");
@@ -225,6 +217,11 @@ public class MainController {
     }
 
     private String getSelectedOperator() {
+        // 一律以登入 Session 為準，忽略 ComboBox 顯示文字，防止身分偽造
+        String sessionUser = SessionContext.getUser();
+        if (sessionUser != null && !sessionUser.isBlank()) {
+            return sessionUser.trim();
+        }
         String val = operatorCombo.getValue();
         if (val == null) return "Unknown";
         return val.split(" ")[0].trim();
@@ -869,9 +866,19 @@ public class MainController {
             return;
         }
 
+        TextInputDialog reasonDialog = new TextInputDialog();
+        reasonDialog.setTitle("反結帳原因");
+        reasonDialog.setHeaderText(String.format("即將重新開啟 %d年%02d月，請填寫原因（必填）", selected.year(), selected.month()));
+        reasonDialog.setContentText("原因：");
+        var opt = reasonDialog.showAndWait();
+        if (opt.isEmpty() || opt.get().trim().isEmpty()) {
+            showWarn("已取消", "反結帳必須填寫原因");
+            return;
+        }
+
         try {
-            closingService.reopenPeriod(selected.year(), selected.month(), getSelectedOperator());
-            showInfo("反結帳成功", String.format("%d年%02d月 期間已重新開啟！", selected.year(), selected.month()));
+            closingService.reopenPeriod(selected.year(), selected.month(), getSelectedOperator(), opt.get().trim());
+            showInfo("反結帳成功", String.format("%d年%02d月 期間已重新開啟！\n原因：%s", selected.year(), selected.month(), opt.get().trim()));
             loadPeriods();
             loadAudits();
         } catch (Exception e) {
