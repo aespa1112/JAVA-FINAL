@@ -1,6 +1,7 @@
 package com.ledger.service;
 
 import com.ledger.config.DbManager;
+import com.ledger.dao.AuditDao;
 import com.ledger.exception.BusinessException;
 import com.ledger.model.OperatorRole;
 import java.io.IOException;
@@ -15,8 +16,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 原始憑證附件管理（商業會計法第 14～16 條精神）。
- * 檔案實體存放於 attachments/{clientDbName}/ 目錄，資料庫只存路徑與中繼資料。
+ * 原始憑證附件管理（教學用）。
+ * 權限：AUDITOR 唯讀；已過帳傳票附件不可直接刪除。
  */
 public class AttachmentService {
 
@@ -31,6 +32,8 @@ public class AttachmentService {
             String uploadedAt,
             String remark
     ) {}
+
+    private final AuditDao auditDao = new AuditDao();
 
     public void ensureTable(Connection conn) throws SQLException {
         try (Statement st = conn.createStatement()) {
@@ -53,6 +56,13 @@ public class AttachmentService {
 
     public Attachment addAttachment(long voucherId, Path sourceFile, String remark, String operator) {
         String normOp = OperatorRole.normalize(operator);
+        OperatorRole role = OperatorRole.resolve(normOp);
+        if (role == OperatorRole.AUDITOR) {
+            throw new BusinessException("權限不足：查帳員（AUDITOR）僅可檢視，不可上傳原始憑證");
+        }
+        if (role == OperatorRole.ADMIN) {
+            throw new BusinessException("管理員不可操作會計傳票附件");
+        }
         if (!Files.exists(sourceFile) || !Files.isRegularFile(sourceFile)) {
             throw new BusinessException("附件檔案不存在");
         }
@@ -60,8 +70,7 @@ public class AttachmentService {
         try (Connection conn = DbManager.get()) {
             ensureTable(conn);
 
-            // 確認傳票存在
-            try (PreparedStatement ps = conn.prepareStatement("SELECT id FROM vouchers WHERE id = ?")) {
+            try (PreparedStatement ps = conn.prepareStatement("SELECT id, status FROM vouchers WHERE id = ?")) {
                 ps.setLong(1, voucherId);
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) {
@@ -86,6 +95,7 @@ public class AttachmentService {
             String sql = "INSERT INTO voucher_attachments " +
                     "(voucher_id, file_name, stored_path, content_type, file_size, uploaded_by, remark) " +
                     "VALUES (?,?,?,?,?,?,?)";
+            long id;
             try (PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
                 ps.setLong(1, voucherId);
                 ps.setString(2, originalName);
@@ -96,11 +106,13 @@ public class AttachmentService {
                 ps.setString(7, remark);
                 ps.executeUpdate();
                 try (ResultSet keys = ps.getGeneratedKeys()) {
-                    long id = keys.next() ? keys.getLong(1) : 0;
-                    return new Attachment(id, voucherId, originalName, target.toString(),
-                            contentType, size, normOp, LocalDateTime.now().toString(), remark);
+                    id = keys.next() ? keys.getLong(1) : 0;
                 }
             }
+            auditDao.log(conn, "ATTACH_ADD", "voucher_attachments", id, normOp,
+                    null, "voucherId=" + voucherId + "; file=" + originalName);
+            return new Attachment(id, voucherId, originalName, target.toString(),
+                    contentType, size, normOp, LocalDateTime.now().toString(), remark);
         } catch (BusinessException e) {
             throw e;
         } catch (Exception e) {
@@ -139,23 +151,49 @@ public class AttachmentService {
     }
 
     public void deleteAttachment(long attachmentId, String operator) {
-        OperatorRole.normalize(operator);
+        String normOp = OperatorRole.normalize(operator);
+        OperatorRole role = OperatorRole.resolve(normOp);
+        if (role == OperatorRole.AUDITOR) {
+            throw new BusinessException("權限不足：查帳員（AUDITOR）不可刪除原始憑證");
+        }
+        if (role == OperatorRole.ADMIN) {
+            throw new BusinessException("管理員不可操作會計傳票附件");
+        }
+
         try (Connection conn = DbManager.get()) {
             ensureTable(conn);
+            long voucherId = 0;
             String path = null;
-            try (PreparedStatement ps = conn.prepareStatement("SELECT stored_path FROM voucher_attachments WHERE id = ?")) {
+            String fileName = null;
+            String status = null;
+            String sql = "SELECT a.voucher_id, a.stored_path, a.file_name, v.status " +
+                    "FROM voucher_attachments a JOIN vouchers v ON v.id = a.voucher_id WHERE a.id = ?";
+            try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setLong(1, attachmentId);
                 try (ResultSet rs = ps.executeQuery()) {
-                    if (rs.next()) path = rs.getString(1);
+                    if (!rs.next()) {
+                        throw new BusinessException("找不到附件 ID: " + attachmentId);
+                    }
+                    voucherId = rs.getLong(1);
+                    path = rs.getString(2);
+                    fileName = rs.getString(3);
+                    status = rs.getString(4);
                 }
+            }
+            if ("POSTED".equalsIgnoreCase(status)) {
+                throw new BusinessException("已過帳傳票之原始憑證不可直接刪除（內控保全）。如需更正請以主管核准流程處理。");
             }
             try (PreparedStatement ps = conn.prepareStatement("DELETE FROM voucher_attachments WHERE id = ?")) {
                 ps.setLong(1, attachmentId);
                 ps.executeUpdate();
             }
+            auditDao.log(conn, "ATTACH_DELETE", "voucher_attachments", attachmentId, normOp,
+                    "voucherId=" + voucherId + "; file=" + fileName, "DELETED");
             if (path != null) {
                 try { Files.deleteIfExists(Paths.get(path)); } catch (IOException ignored) {}
             }
+        } catch (BusinessException e) {
+            throw e;
         } catch (SQLException e) {
             throw new BusinessException("刪除附件失敗: " + e.getMessage(), e);
         }
