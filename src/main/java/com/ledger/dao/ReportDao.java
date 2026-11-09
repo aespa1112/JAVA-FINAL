@@ -250,16 +250,18 @@ public class ReportDao {
     }
 
     public List<FinancialStatementItem> getBalanceSheet(Connection conn, String asOfDate) throws SQLException {
-        // 計算年度結轉邊界：當前會計年度起始日
-        int currentYear = LocalDate.now().getYear();
-        if (asOfDate != null && !asOfDate.trim().isEmpty()) {
+        // 截止日期必填：空值一律視為系統當日，避免納入未來已過帳傳票
+        String effectiveAsOf;
+        if (asOfDate == null || asOfDate.trim().isEmpty()) {
+            effectiveAsOf = LocalDate.now().toString();
+        } else {
             try {
-                LocalDate parsed = LocalDate.parse(asOfDate.trim());
-                currentYear = parsed.getYear();
+                effectiveAsOf = LocalDate.parse(asOfDate.trim()).toString();
             } catch (Exception e) {
                 throw new BusinessException("資產負債表截止日期格式無效，請使用 YYYY-MM-DD 格式: " + asOfDate);
             }
         }
+        int currentYear = LocalDate.parse(effectiveAsOf).getYear();
         String yearStart = String.format("%04d-01-01", currentYear);
 
         StringBuilder sql = new StringBuilder(
@@ -279,10 +281,9 @@ public class ReportDao {
         params.add(yearStart);
         params.add(yearStart);
 
-        if (asOfDate != null && !asOfDate.trim().isEmpty()) {
-            sql.append(" AND v.voucher_date <= ? ");
-            params.add(asOfDate.trim());
-        }
+        // 永遠加上截止日條件
+        sql.append(" AND v.voucher_date <= ? ");
+        params.add(effectiveAsOf)
         sql.append(") ve ON a.id = ve.account_id " +
                    "WHERE a.type IN ('ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE') " +
                    "GROUP BY a.id ORDER BY a.code");
