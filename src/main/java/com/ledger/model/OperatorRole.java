@@ -33,6 +33,9 @@ public enum OperatorRole {
         CANONICAL_NAMES.put(lowerKey, canonical);
     }
 
+    /**
+     * 動態註冊／更新人員到角色白名單（AuthService 載入或新增時呼叫）。
+     */
     public static synchronized void register(String username, OperatorRole role) {
         if (username == null || username.trim().isEmpty()) {
             throw new BusinessException("使用者名稱不可為空");
@@ -49,17 +52,20 @@ public enum OperatorRole {
         CANONICAL_NAMES.put(key, canonical);
     }
 
+    /** 停用帳號時自白名單移除（內建 admin 不移除 canonical 對照亦可被 disable 擋下） */
     public static synchronized void unregister(String username) {
         if (username == null || username.isBlank()) return;
         String key = username.trim().toLowerCase();
         if ("admin".equals(key)) {
-            return;
+            return; // 保留 admin 對照，實際操作仍看 enabled
         }
         ROLE_MAP.remove(key);
         CANONICAL_NAMES.remove(key);
     }
 
+    /** 重新載入前清空動態部分：保留 static 區塊的內建五人後再由 AuthService 覆寫 */
     public static synchronized void clearDynamic() {
+        // 重建為僅內建五人
         ROLE_MAP.clear();
         CANONICAL_NAMES.clear();
         registerInternal("admin", "Admin", ADMIN);
