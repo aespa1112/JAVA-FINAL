@@ -7,6 +7,8 @@ import com.ledger.exception.BusinessException;
 import com.ledger.model.FiscalPeriod;
 import com.ledger.model.OperatorRole;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.List;
 
@@ -27,7 +29,7 @@ public class ClosingService {
     public void closePeriod(int year, int month, String operator) {
         String normOp = OperatorRole.normalize(operator);
         if (OperatorRole.resolve(normOp) != OperatorRole.CHECKER) {
-            throw new BusinessException("權限不足：結帳鎖定涉及期間管制，僅會計師有權執行！");
+            throw new BusinessException("權限不足：期末結帳涉及財務帳簿鎖定，僅會計師（Bob）有權執行！");
         }
 
         try (Connection conn = DbManager.get()) {
@@ -38,7 +40,19 @@ public class ClosingService {
                         .orElseThrow(() -> new BusinessException(String.format("找不到 %d年%02d月 的會計期間", year, month)));
 
                 if (period.isClosed()) {
-                    throw new BusinessException(String.format("%d年%02d月 已結帳鎖定", year, month));
+                    throw new BusinessException(String.format("%d年%02d月 已經是結帳鎖定狀態", year, month));
+                }
+
+                // 檢查是否還有未過帳草稿傳票
+                String checkDraftSql = "SELECT COUNT(*) FROM vouchers WHERE period_id = ? AND status = 'DRAFT'";
+                try (PreparedStatement ps = conn.prepareStatement(checkDraftSql)) {
+                    ps.setLong(1, period.id());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next() && rs.getInt(1) > 0) {
+                            throw new BusinessException(
+                                    String.format("該期間尚有 %d 張未過帳草稿傳票，需全數過帳後方可結帳", rs.getInt(1)));
+                        }
+                    }
                 }
 
                 periodDao.updateStatus(conn, period.id(), "CLOSED");
