@@ -21,7 +21,6 @@ public enum OperatorRole {
     private static final Map<String, String> CANONICAL_NAMES = new ConcurrentHashMap<>();
 
     static {
-        // 預設內建人員
         registerInternal("admin", "Admin", ADMIN);
         registerInternal("amy", "Amy", MAKER);
         registerInternal("bob", "Bob", CHECKER);
@@ -34,9 +33,6 @@ public enum OperatorRole {
         CANONICAL_NAMES.put(lowerKey, canonical);
     }
 
-    /**
-     * 動態註冊新人員到角色白名單（由 AuthService 在載入/新增帳號時呼叫）。
-     */
     public static synchronized void register(String username, OperatorRole role) {
         if (username == null || username.trim().isEmpty()) {
             throw new BusinessException("使用者名稱不可為空");
@@ -45,13 +41,32 @@ public enum OperatorRole {
             throw new BusinessException("角色不可為空");
         }
         String key = username.trim().toLowerCase();
-        // 標準名稱：首字大寫
         String canonical = username.trim().substring(0, 1).toUpperCase() + username.trim().substring(1).toLowerCase();
         if (key.equals("admin")) {
             canonical = "Admin";
         }
         ROLE_MAP.put(key, role);
         CANONICAL_NAMES.put(key, canonical);
+    }
+
+    public static synchronized void unregister(String username) {
+        if (username == null || username.isBlank()) return;
+        String key = username.trim().toLowerCase();
+        if ("admin".equals(key)) {
+            return;
+        }
+        ROLE_MAP.remove(key);
+        CANONICAL_NAMES.remove(key);
+    }
+
+    public static synchronized void clearDynamic() {
+        ROLE_MAP.clear();
+        CANONICAL_NAMES.clear();
+        registerInternal("admin", "Admin", ADMIN);
+        registerInternal("amy", "Amy", MAKER);
+        registerInternal("bob", "Bob", CHECKER);
+        registerInternal("david", "David", CHECKER);
+        registerInternal("charlie", "Charlie", AUDITOR);
     }
 
     public static String normalize(String operator) {
