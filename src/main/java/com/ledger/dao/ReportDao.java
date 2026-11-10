@@ -283,7 +283,7 @@ public class ReportDao {
 
         // 永遠加上截止日條件
         sql.append(" AND v.voucher_date <= ? ");
-        params.add(effectiveAsOf)
+        params.add(effectiveAsOf);
         sql.append(") ve ON a.id = ve.account_id " +
                    "WHERE a.type IN ('ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE') " +
                    "GROUP BY a.id ORDER BY a.code");
