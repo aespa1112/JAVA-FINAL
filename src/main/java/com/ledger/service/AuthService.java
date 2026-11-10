@@ -175,6 +175,13 @@ public class AuthService {
         return acc != null && acc.role() == OperatorRole.ADMIN;
     }
 
+
+    public String getDisplayName(String username) {
+        UserAccount acc = getAccount(username);
+        if (acc == null) return username;
+        return acc.displayName();
+    }
+
     public List<UserAccount> listUsers() {
         List<UserAccount> list = new ArrayList<>();
         try (Connection conn = open();
