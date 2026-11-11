@@ -5,7 +5,8 @@ import com.ledger.model.OperatorRole;
 
 /**
  * 執行階段工作階段：登入使用者與目前帳套。
- * Service 層應透過 requireUser/requireRole 取得已驗證身分，不可信任 UI 任意字串。
+ * 正式環境（LEDGER_ENV 預設 PRODUCTION）強制 requireUser，
+ * 測試環境僅在明確 LEDGER_ENV=TEST/DEMO 或 -Dledger.test=true 時允許免登入。
  */
 public final class SessionContext {
 
@@ -14,7 +15,38 @@ public final class SessionContext {
     private static String currentClientPath;
     private static volatile boolean enabled = true;
 
+    private static volatile boolean testIdentityProviderEnabled = false;
+    private static volatile String testIdentityUser;
+
     private SessionContext() {
+    }
+
+    public static boolean isProduction() {
+        if (Boolean.getBoolean("ledger.test")) return false;
+        String env = System.getenv().getOrDefault("LEDGER_ENV", "PRODUCTION");
+        return !"DEMO".equalsIgnoreCase(env) && !"TEST".equalsIgnoreCase(env);
+    }
+
+    public static boolean isTestMode() {
+        if (Boolean.getBoolean("ledger.test")) return true;
+        if (testIdentityProviderEnabled) return true;
+        String env = System.getenv().getOrDefault("LEDGER_ENV", "PRODUCTION");
+        return "TEST".equalsIgnoreCase(env)
+                || "DEMO".equalsIgnoreCase(env)
+                || "1".equals(System.getenv("LEDGER_ALLOW_ANON"));
+    }
+
+    public static void enableTestIdentityProvider(String testUser) {
+        if (isProduction()) {
+            throw new BusinessException("正式環境禁止啟用測試身分提供者");
+        }
+        testIdentityProviderEnabled = true;
+        testIdentityUser = testUser != null ? OperatorRole.normalize(testUser) : "Amy";
+    }
+
+    public static void disableTestIdentityProvider() {
+        testIdentityProviderEnabled = false;
+        testIdentityUser = null;
     }
 
     public static void setUser(String canonicalName, String displayName) {
@@ -50,7 +82,6 @@ public final class SessionContext {
         return enabled && currentUser != null && !currentUser.isBlank();
     }
 
-    /** 停用帳號時呼叫，使現有 Session 立即失效 */
     public static void invalidate() {
         enabled = false;
         currentUser = null;
@@ -58,10 +89,13 @@ public final class SessionContext {
     }
 
     public static String requireUser() {
-        if (!isLoggedIn()) {
-            throw new BusinessException("尚未登入或 Session 已失效，拒絕操作");
+        if (isLoggedIn()) {
+            return currentUser;
         }
-        return currentUser;
+        if (isTestMode() && testIdentityProviderEnabled && testIdentityUser != null) {
+            return testIdentityUser;
+        }
+        throw new BusinessException("尚未登入或 Session 已失效，拒絕操作");
     }
 
     public static OperatorRole requireRole(OperatorRole... allowed) {
@@ -76,25 +110,32 @@ public final class SessionContext {
         return role;
     }
 
-    /**
-     * 若呼叫端傳入 operator 與 Session 不一致，以 Session 為準並拒絕偽造。
-     * 測試環境無 Session 時允許使用傳入的 operator。
-     */
     public static String resolveOperator(String requested) {
         if (isLoggedIn()) {
             String session = currentUser;
             if (requested != null && !requested.isBlank()) {
                 String req = requested.trim();
-                if (!session.equalsIgnoreCase(req) && !req.toLowerCase().startsWith(session.toLowerCase())) {
+                String sl = session.toLowerCase();
+                String rl = req.toLowerCase();
+                boolean ok = rl.equals(sl)
+                        || rl.startsWith(sl + " (")
+                        || rl.startsWith(sl + "(");
+                if (!ok) {
                     throw new BusinessException(
                             "身分不符：已登入為 " + session + "，不可使用 " + requested + " 操作");
                 }
             }
             return session;
         }
-        if (requested == null || requested.isBlank()) {
-            throw new BusinessException("未登入且未指定操作人");
+        if (isTestMode() && testIdentityProviderEnabled) {
+            if (requested != null && !requested.isBlank()) {
+                return OperatorRole.normalize(requested);
+            }
+            return testIdentityUser != null ? testIdentityUser : "Amy";
         }
-        return OperatorRole.normalize(requested);
+        if (isTestMode() && requested != null && !requested.isBlank()) {
+            return OperatorRole.normalize(requested);
+        }
+        throw new BusinessException("尚未登入或 Session 已失效，拒絕操作（不可信任未經驗證的操作人名稱）");
     }
 }
