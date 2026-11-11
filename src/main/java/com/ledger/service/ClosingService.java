@@ -1,6 +1,7 @@
 package com.ledger.service;
 
 import com.ledger.config.DbManager;
+import com.ledger.config.SessionContext;
 import com.ledger.dao.AuditDao;
 import com.ledger.dao.FiscalPeriodDao;
 import com.ledger.exception.BusinessException;
@@ -27,9 +28,9 @@ public class ClosingService {
     }
 
     public void closePeriod(int year, int month, String operator) {
-        String normOp = OperatorRole.normalize(operator);
+        String normOp = SessionContext.resolveOperator(operator);
         if (OperatorRole.resolve(normOp) != OperatorRole.CHECKER) {
-            throw new BusinessException("權限不足：期末結帳涉及財務帳簿鎖定，僅會計師（Bob）有權執行！");
+            throw new BusinessException("權限不足：期末結帳涉及財務帳簿鎖定，僅會計師有權執行！");
         }
 
         try (Connection conn = DbManager.get()) {
@@ -43,7 +44,6 @@ public class ClosingService {
                     throw new BusinessException(String.format("%d年%02d月 已經是結帳鎖定狀態", year, month));
                 }
 
-                // 檢查是否還有未過帳草稿傳票
                 String checkDraftSql = "SELECT COUNT(*) FROM vouchers WHERE period_id = ? AND status = 'DRAFT'";
                 try (PreparedStatement ps = conn.prepareStatement(checkDraftSql)) {
                     ps.setLong(1, period.id());
@@ -78,7 +78,7 @@ public class ClosingService {
     }
 
     public void reopenPeriod(int year, int month, String operator, String reason) {
-        String normOp = OperatorRole.normalize(operator);
+        String normOp = SessionContext.resolveOperator(operator);
         if (OperatorRole.resolve(normOp) != OperatorRole.CHECKER) {
             throw new BusinessException("權限不足：反結帳操作涉及重新開放帳簿，僅會計師有權執行！");
         }
