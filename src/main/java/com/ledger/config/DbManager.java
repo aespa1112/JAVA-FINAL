@@ -27,7 +27,7 @@ public final class DbManager {
             "PRAGMA journal_mode = WAL;",     // 讀寫並行，查報表時不阻塞寫入
             "PRAGMA foreign_keys = ON;",      // SQLite 預設關閉，必須手動開啟
             "PRAGMA synchronous = FULL;",     // 財務資料優先確保耐久性，不犧牲安全換效能
-            "PRAGMA busy_timeout = 5000;",
+            "PRAGMA busy_timeout = 15000;",
             "PRAGMA cache_size = -8000;"      // 約 8MB 分頁快取
     };
 
@@ -39,34 +39,19 @@ public final class DbManager {
     private DbManager() {
     }
 
-    public static synchronized Connection get() throws SQLException {
+    public static Connection get() throws SQLException {
         String tenant = currentTenant.get();
         if (tenant != null && !tenant.isBlank()) {
             return getForTenant(tenant);
         }
-        if (currentConnection == null || currentConnection.isClosed()) {
-            openConnection(currentDbPath);
-        }
-        return (Connection) Proxy.newProxyInstance(
-                Connection.class.getClassLoader(),
-                new Class<?>[]{Connection.class},
-                (proxy, method, args) -> {
-                    if ("close".equals(method.getName())) {
-                        return null; // 保持單一連線開啟，忽略外層 try-with-resources 的關閉請求
-                    }
-                    if ("isClosed".equals(method.getName())) {
-                        return currentConnection == null || currentConnection.isClosed();
-                    }
-                    try {
-                        return method.invoke(currentConnection, args);
-                    } catch (java.lang.reflect.InvocationTargetException e) {
-                        throw e.getCause();
-                    }
-                }
-        );
+        Connection raw = createRawConnection(currentDbPath);
+        return wrapManagedConnection(raw, currentDbPath);
     }
 
     public static void setCurrentTenant(String tenantId) {
+        if (tenantId != null && !tenantId.isBlank()) {
+            new com.ledger.service.TenantSecurityService().assertAccess(tenantId);
+        }
         currentTenant.set(tenantId);
     }
 
@@ -78,65 +63,67 @@ public final class DbManager {
         currentTenant.remove();
     }
 
-    public static synchronized Connection getForTenant(String tenantId) throws SQLException {
+    public static Connection getForTenant(String tenantId) throws SQLException {
         if (tenantId == null || tenantId.isBlank()) {
             return get();
         }
+        // 租戶授權嚴格檢查：禁止存取未授權租戶
+        new com.ledger.service.TenantSecurityService().assertAccess(tenantId);
+
+        // 租戶路徑安全解析：防範路徑穿越與碰撞
         String dbPath = resolveTenantDbPath(tenantId);
         return getForDb(dbPath);
     }
 
-    public static synchronized Connection getForDb(String dbPath) throws SQLException {
-        Connection conn = tenantConnections.get(dbPath);
-        if (conn == null || conn.isClosed()) {
-            conn = createRawConnection(dbPath);
-            tenantConnections.put(dbPath, conn);
-        }
-        final Connection targetConn = conn;
-        return (Connection) Proxy.newProxyInstance(
-                Connection.class.getClassLoader(),
-                new Class<?>[]{Connection.class},
-                (proxy, method, args) -> {
-                    if ("close".equals(method.getName())) {
-                        return null; // 保持租戶連線持續有效，忽略 try-with-resources 關閉
-                    }
-                    if ("isClosed".equals(method.getName())) {
-                        return targetConn == null || targetConn.isClosed();
-                    }
-                    try {
-                        return method.invoke(targetConn, args);
-                    } catch (java.lang.reflect.InvocationTargetException e) {
-                        throw e.getCause();
-                    }
-                }
-        );
+    public static Connection getForDb(String dbPath) throws SQLException {
+        Connection raw = createRawConnection(dbPath);
+        return wrapManagedConnection(raw, dbPath);
     }
 
     public static String resolveTenantDbPath(String tenantId) {
-        String clean = tenantId.trim().replaceAll("[^a-zA-Z0-9_.-]", "_");
-        return "data/" + clean + ".db";
+        return TenantPathResolver.resolveTenantDbPath(tenantId);
     }
 
     public static synchronized void closeTenant(String tenantId) {
-        String dbPath = resolveTenantDbPath(tenantId);
-        Connection conn = tenantConnections.remove(dbPath);
-        if (conn != null) {
-            try {
-                if (!conn.isClosed()) conn.close();
-            } catch (SQLException ignored) {}
-        }
+        clearCurrentTenant();
     }
 
     public static synchronized void closeAllTenants() {
-        for (Connection conn : tenantConnections.values()) {
-            if (conn != null) {
-                try {
-                    if (!conn.isClosed()) conn.close();
-                } catch (SQLException ignored) {}
-            }
-        }
-        tenantConnections.clear();
+        clearCurrentTenant();
         closeCurrent();
+    }
+
+    private static Connection wrapManagedConnection(Connection realConnection, String dbPath) {
+        return (Connection) Proxy.newProxyInstance(
+                Connection.class.getClassLoader(),
+                new Class<?>[]{Connection.class},
+                new java.lang.reflect.InvocationHandler() {
+                    private volatile boolean closed = false;
+
+                    @Override
+                    public Object invoke(Object proxy, java.lang.reflect.Method method, Object[] args) throws Throwable {
+                        String name = method.getName();
+                        if ("close".equals(name)) {
+                            if (!closed) {
+                                closed = true;
+                                realConnection.close();
+                            }
+                            return null;
+                        }
+                        if ("isClosed".equals(name)) {
+                            return closed || realConnection.isClosed();
+                        }
+                        if (closed || realConnection.isClosed()) {
+                            throw new SQLException("Connection is closed");
+                        }
+                        try {
+                            return method.invoke(realConnection, args);
+                        } catch (java.lang.reflect.InvocationTargetException e) {
+                            throw e.getCause();
+                        }
+                    }
+                }
+        );
     }
 
     public static synchronized void switchDatabase(String dbPath) throws SQLException {
@@ -235,6 +222,21 @@ public final class DbManager {
             } finally {
                 conn.setAutoCommit(originAutoCommit);
             }
+        }
+
+        // 防範版本號與實際 Schema 不一致（例如版本號雖為 3 但觸發器或系統表意外缺失）：主動驗證並安全修復
+        verifyAndRepairSchemaIntegrity(conn);
+    }
+
+    public static void verifyAndRepairSchemaIntegrity(Connection conn) throws SQLException {
+        ensureSystemTables(conn);
+        boolean triggersOk = false;
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='trg_voucher_no_delete'")) {
+            triggersOk = rs.next() && rs.getInt(1) > 0;
+        }
+        if (!triggersOk) {
+            upgradeTriggers(conn);
         }
     }
 

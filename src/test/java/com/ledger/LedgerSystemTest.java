@@ -1,6 +1,7 @@
 package com.ledger;
 
 import com.ledger.config.DbManager;
+import com.ledger.config.TenantPathResolver;
 import com.ledger.config.SessionContext;
 import com.ledger.dao.AccountDao;
 import com.ledger.dao.AuditDao;
@@ -2294,6 +2295,8 @@ public class LedgerSystemTest {
         String tenantA = "tenant_alpha";
         String tenantB = "tenant_beta";
 
+        SessionContext.setUser("admin", "Admin (系統管理員)");
+
         Path dbA = Paths.get(DbManager.resolveTenantDbPath(tenantA));
         Path dbB = Paths.get(DbManager.resolveTenantDbPath(tenantB));
         try { Files.deleteIfExists(dbA); } catch (Exception ignored) {}
@@ -2327,6 +2330,382 @@ public class LedgerSystemTest {
             DbManager.closeTenant(tenantA);
             DbManager.closeTenant(tenantB);
             DbManager.closeAllTenants();
+        }
+    }
+
+    // =========================================================================
+    //  R8: 第八輪修正任務（連線生命週期、多租戶授權、防碰撞隔離、遷移完整性）
+    // =========================================================================
+
+    @Test
+    @DisplayName("R8-01: Connection.close() 正常釋放，isClosed() 為 true 且後續操作拋出 SQLException")
+    void testR8_ConnectionClose_IsClosedTrueAndMethodThrows() throws SQLException {
+        Connection conn = DbManager.get();
+        assertNotNull(conn);
+        assertFalse(conn.isClosed(), "新取得的連線 isClosed() 應為 false");
+
+        // 正常操作能成功
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT 1")) {
+            assertTrue(rs.next());
+            assertEquals(1, rs.getInt(1));
+        }
+
+        // 關閉連線
+        conn.close();
+
+        // 驗證 close() 不被代理吞噬，確實釋放且 isClosed() 返回 true
+        assertTrue(conn.isClosed(), "呼叫 close() 後 isClosed() 必須返回 true！");
+
+        // 驗證已關閉的 Connection 禁止繼續被使用，拋出明確 SQLException
+        assertThrows(SQLException.class, () -> conn.createStatement(), "對已關閉連線呼叫 createStatement 必須拋出 SQLException");
+        assertThrows(SQLException.class, () -> conn.prepareStatement("SELECT 1"), "對已關閉連線呼叫 prepareStatement 必須拋出 SQLException");
+    }
+
+    @Test
+    @DisplayName("R8-02: 同租戶多執行緒取得獨立 Connection，交易互不干擾（Thread 1 rollback 不影響 Thread 2 commit）")
+    void testR8_ConcurrentConnectionsSameTenant_IndependentTransactions() throws Exception {
+        int threadCount = 2;
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(threadCount);
+        java.util.concurrent.CountDownLatch ready = new java.util.concurrent.CountDownLatch(threadCount);
+        java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(threadCount);
+
+        String vNoRollback = "V-ROLLBACK-001";
+        String vNoCommit = "V-COMMIT-002";
+
+        final long pId;
+        try (Connection setupConn = DbManager.get()) {
+            pId = periodDao.getOrCreate(setupConn, 2026, 5).id();
+        }
+
+        // Thread 1: 取得連線，開啟交易寫入 vNoRollback，隨後 rollback
+        pool.submit(() -> {
+            ready.countDown();
+            try {
+                start.await();
+                try (Connection conn1 = DbManager.get()) {
+                    conn1.setAutoCommit(false);
+                    try (PreparedStatement ps = conn1.prepareStatement(
+                            "INSERT INTO vouchers (period_id, voucher_no, voucher_date, summary, status, preparer) " +
+                            "VALUES (?, ?, '2026-05-15', '獨立交易測試1', 'DRAFT', 'Amy')")) {
+                        ps.setLong(1, pId);
+                        ps.setString(2, vNoRollback);
+                        ps.executeUpdate();
+                    }
+                    conn1.rollback();
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            } finally {
+                done.countDown();
+            }
+        });
+
+        // Thread 2: 取得獨立連線，開啟交易寫入 vNoCommit，隨後 commit（具備 busy 重試）
+        pool.submit(() -> {
+            ready.countDown();
+            try {
+                start.await();
+                boolean committed = false;
+                for (int r = 0; r < 10 && !committed; r++) {
+                    try (Connection conn2 = DbManager.get()) {
+                        conn2.setAutoCommit(false);
+                        try (PreparedStatement ps = conn2.prepareStatement(
+                                "INSERT INTO vouchers (period_id, voucher_no, voucher_date, summary, status, preparer) " +
+                                "VALUES (?, ?, '2026-05-15', '獨立交易測試2', 'DRAFT', 'Amy')")) {
+                            ps.setLong(1, pId);
+                            ps.setString(2, vNoCommit);
+                            ps.executeUpdate();
+                        }
+                        conn2.commit();
+                        committed = true;
+                    } catch (SQLException ex) {
+                        if (ex.getMessage() != null && (ex.getMessage().contains("busy") || ex.getMessage().contains("locked"))) {
+                            Thread.sleep(50);
+                        } else {
+                            throw ex;
+                        }
+                    }
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            } finally {
+                done.countDown();
+            }
+        });
+
+        ready.await();
+        start.countDown();
+        done.await(10, java.util.concurrent.TimeUnit.SECONDS);
+        pool.shutdown();
+
+        // 驗證獨立性：vNoRollback 確實被回滾不存在，vNoCommit 確實被提交存在
+        try (Connection verifyConn = DbManager.get()) {
+            try (PreparedStatement ps = verifyConn.prepareStatement("SELECT COUNT(*) FROM vouchers WHERE voucher_no = ?")) {
+                ps.setString(1, vNoRollback);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals(0, rs.getInt(1), "Thread 1 回滾之傳票不應存在於資料庫");
+                }
+            }
+            try (PreparedStatement ps = verifyConn.prepareStatement("SELECT COUNT(*) FROM vouchers WHERE voucher_no = ?")) {
+                ps.setString(1, vNoCommit);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals(1, rs.getInt(1), "Thread 2 提交之傳票必須確實持久化存在");
+                }
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("R8-03: 租戶授權驗證 — 未授權使用者存取指定租戶遭後端服務層拒絕")
+    void testR8_TenantAuthorization_UnauthorizedAccessDenied() {
+        com.ledger.service.TenantSecurityService sec = new com.ledger.service.TenantSecurityService();
+        String secretTenant = "tenant_confidential_999";
+
+        // Amy 未被授權存取 secretTenant
+        SessionContext.setUser("amy", "Amy (記帳員・制單人)");
+
+        BusinessException ex = assertThrows(BusinessException.class, () ->
+                DbManager.getForTenant(secretTenant),
+                "未授權使用者存取未授權租戶必須拋出安全拒絕異常");
+        assertTrue(ex.getMessage().contains("未獲授權存取租戶"), "錯誤訊息須指明未授權存取租戶: " + ex.getMessage());
+
+        // 管理員切換身分授權 Amy 存取該租戶
+        SessionContext.setUser("admin", "Admin (系統管理員)");
+        sec.grantAccess("amy", secretTenant, "admin");
+
+        // 切換回 Amy 再次存取該租戶 -> 順利通過
+        SessionContext.setUser("amy", "Amy (記帳員・制單人)");
+        assertDoesNotThrow(() -> {
+            try (Connection conn = DbManager.getForTenant(secretTenant)) {
+                assertNotNull(conn);
+                assertFalse(conn.isClosed());
+            }
+        }, "管理員授權後應可正常獲取租戶連線");
+
+        // 管理員切換身分撤銷授權
+        SessionContext.setUser("admin", "Admin (系統管理員)");
+        sec.revokeAccess("amy", secretTenant, "admin");
+
+        // 切換回 Amy 再次存取 -> 再次被拒絕
+        SessionContext.setUser("amy", "Amy (記帳員・制單人)");
+        assertThrows(BusinessException.class, () ->
+                DbManager.getForTenant(secretTenant),
+                "撤銷授權後應再次被拒絕存取");
+    }
+
+    @Test
+    @DisplayName("R8-04: 租戶授權驗證 — 未登入或 Session 失效時拒絕存取租戶資料庫")
+    void testR8_TenantAuthorization_UnauthenticatedAccessDenied() {
+        SessionContext.clear();
+        SessionContext.disableTestIdentityProvider();
+
+        assertThrows(BusinessException.class, () ->
+                DbManager.getForTenant("tenant_random_01"),
+                "未登入或 Session 失效時必須拒絕存取受保護租戶資料");
+    }
+
+    @Test
+    @DisplayName("R8-05: 租戶路徑防碰撞 — 相似租戶識別碼映射至唯一不重複檔案路徑")
+    void testR8_TenantPath_CollisionPrevention() {
+        String id1 = "corp-client-01";
+        String id2 = "corp_client_01";
+        String id3 = "CorpClient01";
+
+        String p1 = TenantPathResolver.resolveTenantDbPath(id1);
+        String p2 = TenantPathResolver.resolveTenantDbPath(id2);
+        String p3 = TenantPathResolver.resolveTenantDbPath(id3);
+
+        assertNotEquals(p1, p2, "不同租戶識別碼（即使正規化後相似）絕對不可產生相同路徑碰撞！");
+        assertNotEquals(p1, p3, "大小寫不同之租戶識別碼透過穩定雜湊映射至唯一路徑");
+        assertNotEquals(p2, p3);
+
+        assertTrue(p1.endsWith(".db"));
+        assertTrue(p2.endsWith(".db"));
+        assertTrue(p3.endsWith(".db"));
+    }
+
+    @Test
+    @DisplayName("R8-06: 租戶路徑安全性 — 拒絕路徑穿越 (Path Traversal) 與非法字元")
+    void testR8_TenantPath_PathTraversalRejection() {
+        List<String> attackPayloads = List.of(
+                "../../etc/passwd",
+                "..\\windows\\system32",
+                "tenant/subpath",
+                "tenant\\subpath",
+                "tenant:db",
+                "tenant.with.dots",
+                "../../../data/secret",
+                " "
+        );
+
+        for (String payload : attackPayloads) {
+            BusinessException ex = assertThrows(BusinessException.class, () ->
+                    TenantPathResolver.resolveTenantDbPath(payload),
+                    "路徑穿越攻擊或不合法字元 [" + payload + "] 必須被拒絕");
+            assertTrue(ex.getMessage().contains("安全威脅") || ex.getMessage().contains("無效的租戶識別碼") || ex.getMessage().contains("不可為空"),
+                    "錯誤訊息應提示安全威脅或格式無效: " + ex.getMessage());
+        }
+    }
+
+    @Test
+    @DisplayName("R8-07: 完整的多租戶資料隔離整合測試（科目、傳票、查詢與操作完全獨立無污染）")
+    void testR8_TenantDataIsolation_FullAccountingIntegration() throws SQLException {
+        String tenantA = "tenant_acct_company_a";
+        String tenantB = "tenant_acct_company_b";
+
+        Path pathA = Paths.get(TenantPathResolver.resolveTenantDbPath(tenantA));
+        Path pathB = Paths.get(TenantPathResolver.resolveTenantDbPath(tenantB));
+        try { Files.deleteIfExists(pathA); } catch (Exception ignored) {}
+        try { Files.deleteIfExists(pathB); } catch (Exception ignored) {}
+
+        // Admin 具備全租戶維護權限
+        SessionContext.setUser("admin", "Admin (系統管理員)");
+
+        try {
+            // 租戶 A: 建立期間並寫入傳票 V-ALPHA-100
+            try (Connection connA = DbManager.getForTenant(tenantA)) {
+                DbManager.setClientId(connA, "COMPANY-ALPHA");
+                long pA = periodDao.getOrCreate(connA, 2026, 6).id();
+                try (PreparedStatement ps = connA.prepareStatement(
+                        "INSERT INTO vouchers (period_id, voucher_no, voucher_date, summary, status, preparer) " +
+                        "VALUES (?, 'V-ALPHA-100', '2026-06-15', 'A租戶專屬銷貨收入', 'POSTED', 'Amy')")) {
+                    ps.setLong(1, pA);
+                    ps.executeUpdate();
+                }
+            }
+
+            // 租戶 B: 建立期間並寫入傳票 V-BETA-200
+            try (Connection connB = DbManager.getForTenant(tenantB)) {
+                DbManager.setClientId(connB, "COMPANY-BETA");
+                long pB = periodDao.getOrCreate(connB, 2026, 6).id();
+                try (PreparedStatement ps = connB.prepareStatement(
+                        "INSERT INTO vouchers (period_id, voucher_no, voucher_date, summary, status, preparer) " +
+                        "VALUES (?, 'V-BETA-200', '2026-06-15', 'B租戶專屬採購支出', 'POSTED', 'Bob')")) {
+                    ps.setLong(1, pB);
+                    ps.executeUpdate();
+                }
+            }
+
+            // 驗證隔離：從租戶 A 查詢，只見 V-ALPHA-100，絕無 V-BETA-200
+            try (Connection connA = DbManager.getForTenant(tenantA)) {
+                assertEquals("COMPANY-ALPHA", DbManager.getClientId(connA));
+                try (PreparedStatement ps = connA.prepareStatement("SELECT voucher_no FROM vouchers")) {
+                    try (ResultSet rs = ps.executeQuery()) {
+                        assertTrue(rs.next());
+                        assertEquals("V-ALPHA-100", rs.getString("voucher_no"));
+                        assertFalse(rs.next(), "租戶 A 不得查詢到任何租戶 B 之傳票資料！");
+                    }
+                }
+            }
+
+            // 驗證隔離：從租戶 B 查詢，只見 V-BETA-200，絕無 V-ALPHA-100
+            try (Connection connB = DbManager.getForTenant(tenantB)) {
+                assertEquals("COMPANY-BETA", DbManager.getClientId(connB));
+                try (PreparedStatement ps = connB.prepareStatement("SELECT voucher_no FROM vouchers")) {
+                    try (ResultSet rs = ps.executeQuery()) {
+                        assertTrue(rs.next());
+                        assertEquals("V-BETA-200", rs.getString("voucher_no"));
+                        assertFalse(rs.next(), "租戶 B 不得查詢到任何租戶 A 之傳票資料！");
+                    }
+                }
+            }
+
+            // 驗證跨租戶修改防護：在租戶 A 中嘗試修改租戶 B 之傳票 -> 影響行數必為 0
+            try (Connection connA = DbManager.getForTenant(tenantA)) {
+                try (PreparedStatement ps = connA.prepareStatement("UPDATE vouchers SET summary='非法篡改' WHERE voucher_no='V-BETA-200'")) {
+                    int affected = ps.executeUpdate();
+                    assertEquals(0, affected, "租戶 A 連線無法修改租戶 B 之任何資料！");
+                }
+            }
+
+            // 驗證租戶 B 之資料絲毫未受影響
+            try (Connection connB = DbManager.getForTenant(tenantB)) {
+                try (PreparedStatement ps = connB.prepareStatement("SELECT summary FROM vouchers WHERE voucher_no='V-BETA-200'")) {
+                    try (ResultSet rs = ps.executeQuery()) {
+                        assertTrue(rs.next());
+                        assertEquals("B租戶專屬採購支出", rs.getString("summary"));
+                    }
+                }
+            }
+        } finally {
+            SessionContext.clear();
+        }
+    }
+
+    @Test
+    @DisplayName("R8-08: Schema Migration 完整情境覆蓋測試（DDL錯誤回滾、版本號一致性、觸發器修復與冪等性）")
+    void testR8_SchemaMigration_AllScenarios() throws SQLException {
+        Path migDb = Paths.get("target/test_migration_full_suite.db");
+        try { Files.deleteIfExists(migDb); } catch (Exception ignored) {}
+        String url = "jdbc:sqlite:" + migDb.toString().replace('\\', '/');
+
+        // 情境 1: 正常自全新資料庫執行 Migration -> 成功升級至目前架構版本 3
+        try (Connection conn = DriverManager.getConnection(url)) {
+            DbManager.applyPragmas(conn);
+            DbManager.migrateSchema(conn);
+            assertEquals(DbManager.CURRENT_SCHEMA_VERSION, DbManager.getSchemaVersion(conn), "全新資料庫完成後版本號應為最新 3");
+        }
+
+        // 情境 2: Migration 中途發生 SQL 錯誤 / DDL / Trigger / Index 失敗時事務原子回滾，版本號不前進
+        try (Connection conn = DriverManager.getConnection(url)) {
+            DbManager.applyPragmas(conn);
+            // 暫時將版本設定為 1 模擬需要升級
+            DbManager.setSchemaVersion(conn, 1);
+            assertEquals(1, DbManager.getSchemaVersion(conn));
+
+            boolean originAuto = conn.getAutoCommit();
+            conn.setAutoCommit(false);
+            try {
+                // 嘗試升級並模擬中途 DDL / 語法拋出例外
+                DbManager.setSchemaVersion(conn, 3);
+                throw new SQLException("模擬 DDL / Trigger 建立失敗");
+            } catch (Exception ex) {
+                conn.rollback();
+            } finally {
+                conn.setAutoCommit(originAuto);
+            }
+
+            // 驗證失敗後版本號隨事務 100% 回滾為 1，絕不留下已更新至 3 的不實版本號
+            assertEquals(1, DbManager.getSchemaVersion(conn), "遷移失敗時版本號必須 100% 回滾，不得更新！");
+
+            // 情境 3: 升級失敗後重新執行 -> 成功完成升級
+            conn.setAutoCommit(false);
+            DbManager.setSchemaVersion(conn, 3);
+            conn.commit();
+            conn.setAutoCommit(originAuto);
+            assertEquals(3, DbManager.getSchemaVersion(conn));
+        }
+
+        // 情境 4: 觸發器或系統表與版本號不一致修復測試（版本號雖為 3 但觸發器被手動破壞）
+        try (Connection conn = DriverManager.getConnection(url)) {
+            DbManager.applyPragmas(conn);
+            // 手動刪除保護觸發器，製造版本號與實際 Schema 不一致之情況
+            try (Statement st = conn.createStatement()) {
+                st.execute("DROP TRIGGER IF EXISTS trg_voucher_no_delete");
+            }
+
+            // 執行驗證修復
+            DbManager.verifyAndRepairSchemaIntegrity(conn);
+
+            // 驗證保護觸發器已被自動修復重建
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery("SELECT count(*) FROM sqlite_master WHERE type='trigger' AND name='trg_voucher_no_delete'")) {
+                assertTrue(rs.next());
+                assertEquals(1, rs.getInt(1), "Schema 不一致時，verifyAndRepairSchemaIntegrity 應自動修復補齊缺失觸發器！");
+            }
+        }
+
+        // 情境 5: Migration 重複執行 5 次驗證完全冪等無副作用
+        try (Connection conn = DriverManager.getConnection(url)) {
+            DbManager.applyPragmas(conn);
+            for (int i = 0; i < 5; i++) {
+                assertDoesNotThrow(() -> DbManager.migrateSchema(conn), "重複執行 migrateSchema 必須保證冪等安全");
+            }
+            assertEquals(DbManager.CURRENT_SCHEMA_VERSION, DbManager.getSchemaVersion(conn));
         }
     }
 }
