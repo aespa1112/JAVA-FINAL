@@ -97,6 +97,9 @@
                 <HBox spacing="10" alignment="CENTER_LEFT">
                     <Button text="🔒 執行期末結帳（鎖定）" onAction="#onClosePeriod" styleClass="button-warning"/>
                     <Button text="🔓 反結帳（重新開啟）" onAction="#onReopenPeriod" styleClass="button-secondary"/>
+                    <Button text="📅 年度結帳分錄" onAction="#onYearEndClose" styleClass="button-warning"/>
+                    <Button text="年度反結帳" onAction="#onYearEndReopen" styleClass="button-secondary"/>
+                    <Button text="期初餘額匯入" onAction="#onImportOpening" styleClass="button-secondary"/>
                     <Button text="重新整理" onAction="#loadPeriods" styleClass="button-secondary"/>
                     <Region HBox.hgrow="ALWAYS"/>
                     <Label text="結帳鎖定後該期間將嚴格禁止新增或更動憑證（資料庫觸發器自動保護）" style="-fx-text-fill: #b45309; -fx-font-weight: bold;"/>
@@ -120,6 +123,7 @@
                     <DatePicker fx:id="reportEndDatePicker" promptText="結束日期" prefWidth="130"/>
                     <Button text="產生報表" onAction="#loadReports" styleClass="button"/>
                     <Button text="匯出試算表 CSV" onAction="#onExportReportCsv" styleClass="button-success"/>
+                    <Button text="報表勾稽檢查" onAction="#onReconcileReports" styleClass="button-secondary"/>
                 </HBox>
 
                 <TabPane VBox.vgrow="ALWAYS" tabClosingPolicy="UNAVAILABLE">
