@@ -141,6 +141,8 @@ public class MainController {
     private FiscalPeriodDao periodDao;
     private AuditDao auditDao;
     private ClosingService closingService;
+    private YearEndClosingService yearEndClosingService;
+    private OpeningBalanceService openingBalanceService;
     private BackupService backupService;
     private ReportService reportService;
     private AttachmentService attachmentService;
@@ -153,6 +155,8 @@ public class MainController {
         auditDao = new AuditDao();
         voucherService = new VoucherService(voucherDao, periodDao, auditDao);
         closingService = new ClosingService(periodDao, auditDao);
+        yearEndClosingService = new YearEndClosingService();
+        openingBalanceService = new OpeningBalanceService();
         backupService = new BackupService();
         reportService = new ReportService();
         attachmentService = new AttachmentService();
@@ -1061,6 +1065,134 @@ public class MainController {
             }
         } catch (Exception e) {
             showError("原始憑證操作失敗", e.getMessage());
+        }
+    }
+
+
+    @FXML
+    public void onYearEndClose() {
+        String sessionUser = getSelectedOperator();
+        OperatorRole sr = OperatorRole.resolve(sessionUser);
+        TextInputDialog yearDlg = new TextInputDialog(String.valueOf(java.time.LocalDate.now().getYear()));
+        yearDlg.setTitle("年度結帳");
+        yearDlg.setHeaderText("將經「制單→審核」流程產生結帳分錄並鎖定該年");
+        yearDlg.setContentText("會計年度：");
+        yearDlg.showAndWait().ifPresent(yearStr -> {
+            try {
+                int year = Integer.parseInt(yearStr.trim());
+                String prep;
+                String rev;
+                if (sr == OperatorRole.MAKER) {
+                    prep = sessionUser;
+                    TextInputDialog d = new TextInputDialog("Bob");
+                    d.setTitle("審核人");
+                    d.setHeaderText("請輸入審核會計師（不可與制單人相同）");
+                    d.setContentText("審核人：");
+                    var o = d.showAndWait();
+                    if (o.isEmpty()) return;
+                    rev = o.get().trim();
+                } else if (sr == OperatorRole.CHECKER) {
+                    rev = sessionUser;
+                    TextInputDialog d = new TextInputDialog("Amy");
+                    d.setTitle("制單人");
+                    d.setHeaderText("請輸入制單記帳員");
+                    d.setContentText("制單人：");
+                    var o = d.showAndWait();
+                    if (o.isEmpty()) return;
+                    prep = o.get().trim();
+                } else {
+                    showWarn("權限不足", "僅記帳員或會計師可參與年度結帳");
+                    return;
+                }
+                var ids = yearEndClosingService.closeYear(year, prep, rev);
+                showInfo("年度結帳完成", "結帳傳票 ID: " + ids);
+                loadPeriods();
+                loadVouchers();
+                loadReports();
+                loadAudits();
+            } catch (Exception ex) {
+                showError("年度結帳失敗", ex.getMessage());
+            }
+        });
+    }
+
+    @FXML
+    public void onYearEndReopen() {
+        if (OperatorRole.resolve(getSelectedOperator()) != OperatorRole.CHECKER) {
+            showWarn("權限不足", "年度反結帳僅會計師可執行");
+            return;
+        }
+        TextInputDialog yearDlg = new TextInputDialog(String.valueOf(java.time.LocalDate.now().getYear()));
+        yearDlg.setTitle("年度反結帳");
+        yearDlg.setHeaderText("將解鎖該年並產生紅字沖銷草稿");
+        yearDlg.setContentText("會計年度：");
+        yearDlg.showAndWait().ifPresent(yearStr -> {
+            TextInputDialog reasonDlg = new TextInputDialog();
+            reasonDlg.setTitle("反結帳原因");
+            reasonDlg.setHeaderText("必填原因");
+            reasonDlg.setContentText("原因：");
+            reasonDlg.showAndWait().ifPresent(reason -> {
+                try {
+                    int year = Integer.parseInt(yearStr.trim());
+                    long revId = yearEndClosingService.reopenYear(year, getSelectedOperator(), reason.trim());
+                    showInfo("年度反結帳完成", year + " 年已解鎖\n紅字沖銷草稿 ID: " + revId + "\n請由另一位會計師過帳");
+                    loadPeriods();
+                    loadVouchers();
+                    loadAudits();
+                } catch (Exception ex) {
+                    showError("年度反結帳失敗", ex.getMessage());
+                }
+            });
+        });
+    }
+
+    @FXML
+    public void onImportOpening() {
+        if (OperatorRole.resolve(getSelectedOperator()) != OperatorRole.CHECKER) {
+            showWarn("權限不足", "期初餘額僅會計師可匯入");
+            return;
+        }
+        TextInputDialog dateDlg = new TextInputDialog(java.time.LocalDate.now().withDayOfYear(1).toString());
+        dateDlg.setTitle("期初餘額");
+        dateDlg.setHeaderText("示範：借 1101 / 貸 3101");
+        dateDlg.setContentText("日期：");
+        dateDlg.showAndWait().ifPresent(date -> {
+            TextInputDialog amtDlg = new TextInputDialog("100000");
+            amtDlg.setHeaderText("金額（元）");
+            amtDlg.showAndWait().ifPresent(amtStr -> {
+                try {
+                    long major = new java.math.BigDecimal(amtStr.trim()).movePointRight(2).longValueExact();
+                    var lines = java.util.List.of(
+                        new OpeningBalanceService.OpeningLine("1101", major, 0, "期初現金"),
+                        new OpeningBalanceService.OpeningLine("3101", 0, major, "期初股本")
+                    );
+                    long id = openingBalanceService.importOpening(date.trim(), lines, getSelectedOperator());
+                    showInfo("期初匯入成功", "傳票 ID: " + id);
+                    loadVouchers(); loadReports(); loadAudits();
+                } catch (Exception ex) {
+                    showError("期初失敗", ex.getMessage());
+                }
+            });
+        });
+    }
+
+    @FXML
+    public void onReconcileReports() {
+        String start = reportStartDatePicker.getValue() == null ? null : reportStartDatePicker.getValue().toString();
+        String end = reportEndDatePicker.getValue() == null ? null : reportEndDatePicker.getValue().toString();
+        try {
+            var svc = new ReportReconciliationService();
+            var results = svc.reconcile(start, end);
+            StringBuilder sb = new StringBuilder();
+            boolean all = true;
+            for (var r : results) {
+                sb.append(r.passed() ? "✓ " : "✗ ").append(r.name()).append(" — ").append(r.detail()).append("\n");
+                if (!r.passed()) all = false;
+            }
+            if (all) showInfo("報表勾稽", "全部通過\n\n" + sb);
+            else showWarn("報表勾稽", "存在差異\n\n" + sb);
+        } catch (Exception e) {
+            showError("勾稽失敗", e.getMessage());
         }
     }
 
