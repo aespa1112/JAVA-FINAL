@@ -1,6 +1,7 @@
 package com.ledger.service;
 
 import com.ledger.config.DbManager;
+import com.ledger.config.SessionContext;
 import com.ledger.dao.AccountDao;
 import com.ledger.dao.AuditDao;
 import com.ledger.dao.FiscalPeriodDao;
@@ -83,7 +84,7 @@ public class VoucherService {
     }
 
     public Voucher createDraft(String voucherDate, String summary, Long reversedId, String preparer, List<VoucherEntry> entries) {
-        String normPreparer = OperatorRole.normalize(preparer);
+        String normPreparer = SessionContext.resolveOperator(preparer);
         OperatorRole role = OperatorRole.resolve(normPreparer);
         if (role == OperatorRole.AUDITOR) {
             throw new BusinessException("權限不足：查帳員（" + normPreparer + "）為唯讀身分，無權建立傳票");
@@ -181,7 +182,7 @@ public class VoucherService {
             throw new BusinessException("審核人不可為空");
         }
 
-        String normReviewer = OperatorRole.normalize(reviewer);
+        String normReviewer = SessionContext.resolveOperator(reviewer);
         OperatorRole role = OperatorRole.resolve(normReviewer);
         if (role != OperatorRole.CHECKER) {
             throw new BusinessException("權限不足：僅會計師（審核人）有權審核過帳傳票，當前身分無此權限！");
@@ -265,7 +266,7 @@ public class VoucherService {
             throw new BusinessException("請填寫沖銷原因");
         }
 
-        String normOp = OperatorRole.normalize(operator);
+        String normOp = SessionContext.resolveOperator(operator);
         OperatorRole role = OperatorRole.resolve(normOp);
         if (role == OperatorRole.AUDITOR) {
             throw new BusinessException("權限不足：查帳員為唯讀身分，無權進行紅字沖銷");
@@ -322,7 +323,7 @@ public class VoucherService {
     }
 
     public void updateDraft(long voucherId, String voucherDate, String summary, String operator, List<VoucherEntry> entries) {
-        String normOp = OperatorRole.normalize(operator);
+        String normOp = SessionContext.resolveOperator(operator);
         OperatorRole role = OperatorRole.resolve(normOp);
         if (role == OperatorRole.AUDITOR) {
             throw new BusinessException("權限不足：查帳員為唯讀身分，無權修改草稿傳票");
@@ -399,7 +400,7 @@ public class VoucherService {
     }
 
     public void deleteDraft(long voucherId, String operator) {
-        String normOp = OperatorRole.normalize(operator);
+        String normOp = SessionContext.resolveOperator(operator);
         OperatorRole role = OperatorRole.resolve(normOp);
         if (role != OperatorRole.MAKER) {
             throw new BusinessException("權限不足：僅記帳員（制單人）有權刪除草稿傳票");
