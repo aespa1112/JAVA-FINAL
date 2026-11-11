@@ -19,7 +19,24 @@ import java.util.Map;
  */
 public class ReportReconciliationService {
 
-    public record CheckResult(String name, boolean passed, String detail, long leftMinor, long rightMinor) {}
+    public enum CheckStatus {
+        PASSED,
+        FAILED,
+        NOT_CHECKED
+    }
+
+    public record CheckResult(
+            String name,
+            boolean passed,
+            String detail,
+            long leftMinor,
+            long rightMinor,
+            CheckStatus status
+    ) {
+        public CheckResult(String name, boolean passed, String detail, long leftMinor, long rightMinor) {
+            this(name, passed, detail, leftMinor, rightMinor, passed ? CheckStatus.PASSED : CheckStatus.FAILED);
+        }
+    }
 
     public record AccountMatch(
             String accountCode,
@@ -96,18 +113,49 @@ public class ReportReconciliationService {
         ));
 
         
-        // 現金科目與現金流量表期末勾稽（若有 1101）
+        // 現金流量表期末現金 vs 帳列現金及約當現金勾稽（不固定回傳 true）
         try {
-            long cashTb = 0;
-            for (TrialBalanceItem i : tb) {
-                if ("1101".equals(i.accountCode())) {
-                    cashTb = i.netMinor();
-                    break;
+            List<FinancialStatementItem> cf = reportService.getCashFlow(startDate, endDate);
+            Long endCash = null;
+            Long actualCash = null;
+            for (FinancialStatementItem item : cf) {
+                if ("END_CASH".equals(item.code())) {
+                    endCash = item.amountMinor();
+                } else if ("ACTUAL_CASH".equals(item.code())) {
+                    actualCash = item.amountMinor();
                 }
             }
-            results.add(new CheckResult("現金科目餘額揭露", true,
-                    String.format("1101 淨額=%d 分（請與現金流量表期末現金核對）", cashTb), cashTb, cashTb));
-        } catch (Exception ignored) {
+            if (endCash != null && actualCash != null) {
+                boolean match = endCash.equals(actualCash);
+                results.add(new CheckResult(
+                        "現金流量表期末現金 vs 帳列現金及約當現金",
+                        match,
+                        match
+                                ? String.format("現金流量表期末現金 (%d 分) 與帳列現金及約當現金 (%d 分) 一致", endCash, actualCash)
+                                : String.format("現金流量表期末現金 (%d 分) 與帳列現金及約當現金 (%d 分) 不一致，差額=%d 分", endCash, actualCash, endCash - actualCash),
+                        endCash,
+                        actualCash,
+                        match ? CheckStatus.PASSED : CheckStatus.FAILED
+                ));
+            } else {
+                results.add(new CheckResult(
+                        "現金流量表期末現金 vs 帳列現金及約當現金",
+                        false,
+                        "現金流量表未產生期末現金資訊",
+                        0,
+                        0,
+                        CheckStatus.NOT_CHECKED
+                ));
+            }
+        } catch (Exception e) {
+            results.add(new CheckResult(
+                    "現金流量表期末現金 vs 帳列現金及約當現金",
+                    false,
+                    "現金流量表勾稽異常: " + e.getMessage(),
+                    0,
+                    0,
+                    CheckStatus.NOT_CHECKED
+            ));
         }
 
         return results;
@@ -153,7 +201,7 @@ public class ReportReconciliationService {
 
     public void assertAllPass(String startDate, String endDate) {
         for (CheckResult r : reconcile(startDate, endDate)) {
-            if (!r.passed()) {
+            if (r.status() == CheckStatus.FAILED || (!r.passed() && r.status() != CheckStatus.NOT_CHECKED)) {
                 throw new BusinessException("報表勾稽失敗: " + r.name() + " — " + r.detail());
             }
         }

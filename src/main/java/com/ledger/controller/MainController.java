@@ -1071,41 +1071,29 @@ public class MainController {
 
     @FXML
     public void onYearEndClose() {
-        String sessionUser = getSelectedOperator();
+        String sessionUser = SessionContext.isLoggedIn() ? SessionContext.getUser() : getSelectedOperator();
         OperatorRole sr = OperatorRole.resolve(sessionUser);
+        if (sr != OperatorRole.MAKER && sr != OperatorRole.CHECKER) {
+            showWarn("權限不足", "僅記帳員（MAKER）可建立結帳草稿，會計師（CHECKER）可審核過帳");
+            return;
+        }
+
         TextInputDialog yearDlg = new TextInputDialog(String.valueOf(java.time.LocalDate.now().getYear()));
         yearDlg.setTitle("年度結帳");
-        yearDlg.setHeaderText("將經「制單→審核」流程產生結帳分錄並鎖定該年");
+        yearDlg.setHeaderText(sr == OperatorRole.MAKER
+                ? "【階段一】記帳員（MAKER）建立結帳草稿分錄"
+                : "【階段二】會計師（CHECKER）審核並過帳結帳草稿");
         yearDlg.setContentText("會計年度：");
         yearDlg.showAndWait().ifPresent(yearStr -> {
             try {
                 int year = Integer.parseInt(yearStr.trim());
-                String prep;
-                String rev;
                 if (sr == OperatorRole.MAKER) {
-                    prep = sessionUser;
-                    TextInputDialog d = new TextInputDialog("Bob");
-                    d.setTitle("審核人");
-                    d.setHeaderText("請輸入審核會計師（不可與制單人相同）");
-                    d.setContentText("審核人：");
-                    var o = d.showAndWait();
-                    if (o.isEmpty()) return;
-                    rev = o.get().trim();
-                } else if (sr == OperatorRole.CHECKER) {
-                    rev = sessionUser;
-                    TextInputDialog d = new TextInputDialog("Amy");
-                    d.setTitle("制單人");
-                    d.setHeaderText("請輸入制單記帳員");
-                    d.setContentText("制單人：");
-                    var o = d.showAndWait();
-                    if (o.isEmpty()) return;
-                    prep = o.get().trim();
+                    long draftId = yearEndClosingService.createYearEndDraft(year, sessionUser);
+                    showInfo("年度結帳草稿已建立", "已成功建立 " + year + " 年度結帳草稿（傳票 ID: " + draftId + "）。\n狀態已持久化為 DRAFT。\n依內控職責分離原則，請由審核會計師（CHECKER）登入系統審核並過帳。");
                 } else {
-                    showWarn("權限不足", "僅記帳員或會計師可參與年度結帳");
-                    return;
+                    long postedId = yearEndClosingService.reviewAndPostYearEnd(year, sessionUser);
+                    showInfo("年度結帳完成", year + " 年度結帳傳票（ID: " + postedId + "）已審核過帳！\n全年度（1～12月）期間已全數鎖定（CLOSED）。");
                 }
-                var ids = yearEndClosingService.closeYear(year, prep, rev);
-                showInfo("年度結帳完成", "結帳傳票 ID: " + ids);
                 loadPeriods();
                 loadVouchers();
                 loadReports();
@@ -1118,31 +1106,66 @@ public class MainController {
 
     @FXML
     public void onYearEndReopen() {
-        if (OperatorRole.resolve(getSelectedOperator()) != OperatorRole.CHECKER) {
+        String sessionUser = SessionContext.isLoggedIn() ? SessionContext.getUser() : getSelectedOperator();
+        if (OperatorRole.resolve(sessionUser) != OperatorRole.CHECKER) {
             showWarn("權限不足", "年度反結帳僅會計師可執行");
             return;
         }
         TextInputDialog yearDlg = new TextInputDialog(String.valueOf(java.time.LocalDate.now().getYear()));
         yearDlg.setTitle("年度反結帳");
-        yearDlg.setHeaderText("將解鎖該年並產生紅字沖銷草稿");
+        yearDlg.setHeaderText("雙人反結帳控制（發起沖銷草稿 → 第二位會計師審核過帳）");
         yearDlg.setContentText("會計年度：");
         yearDlg.showAndWait().ifPresent(yearStr -> {
-            TextInputDialog reasonDlg = new TextInputDialog();
-            reasonDlg.setTitle("反結帳原因");
-            reasonDlg.setHeaderText("必填原因");
-            reasonDlg.setContentText("原因：");
-            reasonDlg.showAndWait().ifPresent(reason -> {
-                try {
-                    int year = Integer.parseInt(yearStr.trim());
-                    long revId = yearEndClosingService.reopenYear(year, getSelectedOperator(), reason.trim());
-                    showInfo("年度反結帳完成", year + " 年已解鎖\n紅字沖銷草稿 ID: " + revId + "\n請由另一位會計師過帳");
-                    loadPeriods();
-                    loadVouchers();
-                    loadAudits();
-                } catch (Exception ex) {
-                    showError("年度反結帳失敗", ex.getMessage());
+            try {
+                int year = Integer.parseInt(yearStr.trim());
+                // 判斷當前是否已有待審核的反結草稿
+                boolean hasReopenDraft = false;
+                try (var conn = com.ledger.config.DbManager.get()) {
+                    yearEndClosingService.ensureTable(conn);
+                    try (var ps = conn.prepareStatement("SELECT status FROM year_end_closings WHERE fiscal_year=?")) {
+                        ps.setInt(1, year);
+                        try (var rs = ps.executeQuery()) {
+                            if (rs.next() && "REOPEN_DRAFT".equals(rs.getString("status"))) {
+                                hasReopenDraft = true;
+                            }
+                        }
+                    }
                 }
-            });
+
+                if (hasReopenDraft) {
+                    Alert confirm = new Alert(Alert.AlertType.CONFIRMATION);
+                    confirm.setTitle("審核反結傳票");
+                    confirm.setHeaderText("已存在 " + year + " 年度待審核之紅字沖銷草稿");
+                    confirm.setContentText("是否以目前登入之會計師（" + sessionUser + "）完成審核過帳並解鎖該年度期間？");
+                    var res = confirm.showAndWait();
+                    if (res.isPresent() && res.get() == ButtonType.OK) {
+                        long revId = yearEndClosingService.confirmReopenYear(year, sessionUser);
+                        showInfo("年度反結帳完成", year + " 年反結沖銷傳票（ID: " + revId + "）已過帳！\n該年度期間已重新開放（OPEN）。");
+                        loadPeriods();
+                        loadVouchers();
+                        loadAudits();
+                    }
+                    return;
+                }
+
+                TextInputDialog reasonDlg = new TextInputDialog();
+                reasonDlg.setTitle("反結帳原因");
+                reasonDlg.setHeaderText("必填原因（將發起紅字沖銷草稿）");
+                reasonDlg.setContentText("原因：");
+                reasonDlg.showAndWait().ifPresent(reason -> {
+                    try {
+                        long revDraftId = yearEndClosingService.initiateReopenYear(year, sessionUser, reason.trim());
+                        showInfo("年度反結草稿已建立", year + " 年紅字沖銷草稿 ID: " + revDraftId + " 已建立。\n狀態為 REOPEN_DRAFT，期間仍維持鎖定。\n依內控職責分離原則，請由第二位會計師登入審核過帳完成反結！");
+                        loadPeriods();
+                        loadVouchers();
+                        loadAudits();
+                    } catch (Exception ex) {
+                        showError("年度反結帳失敗", ex.getMessage());
+                    }
+                });
+            } catch (Exception ex) {
+                showError("年度反結帳失敗", ex.getMessage());
+            }
         });
     }
 

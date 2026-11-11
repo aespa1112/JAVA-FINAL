@@ -259,6 +259,10 @@ public class VoucherService {
     }
 
     public Voucher reverse(long originId, String reason, String operator) {
+        return reverse(originId, null, reason, operator);
+    }
+
+    public Voucher reverse(long originId, String targetDate, String reason, String operator) {
         if (operator == null || operator.trim().isEmpty()) {
             throw new BusinessException("沖銷操作人不可為空");
         }
@@ -306,7 +310,9 @@ public class VoucherService {
             }
 
             String summary = "【沖銷】" + reason.trim();
-            String today = LocalDate.now().toString();
+            String draftDate = (targetDate != null && !targetDate.isBlank())
+                    ? targetDate.trim()
+                    : LocalDate.now().toString();
 
             // 沖銷傳票之制單人保留原傳票制單人（MAKER），以符合會計內控職責分離原則；
             // 審核時必須由另一位會計師審核，杜絕一人沖銷加過帳的風險
@@ -315,7 +321,7 @@ public class VoucherService {
                     : "Amy";
 
             // 在同一交易中建立草稿並寫入 REVERSE_INITIATED，確保原子性
-            return createDraftInternal(today, summary, originId, preparer, reversedEntries,
+            return createDraftInternal(draftDate, summary, originId, preparer, reversedEntries,
                     normOp, origin.voucherNo());
         } catch (SQLException e) {
             throw new BusinessException("沖銷操作異常: " + e.getMessage(), e);
