@@ -1662,11 +1662,14 @@ public class LedgerSystemTest {
         setupFullYearPeriods(year);
         closingService.closePeriod(year, 12, "Bob");
 
-        // 模擬異常崩潰中斷：12月在結帳草稿中途被解鎖為 OPEN，且程序意外終止無 POSTED 年結
-        try (Connection conn = DbManager.get();
-             PreparedStatement ps = conn.prepareStatement("UPDATE fiscal_periods SET status='OPEN' WHERE year=? AND month=12")) {
-            ps.setInt(1, year);
-            ps.executeUpdate();
+        // 模擬異常崩潰中斷：12月在結帳草稿中途被解鎖為 OPEN，並留下 IN_PROGRESS 復原意圖紀錄
+        try (Connection conn = DbManager.get()) {
+            YearEndClosingService initYe = new YearEndClosingService();
+            initYe.recordRecoveryIntent(conn, "REC-CRASH-" + year, year, 12, "CLOSED", "YEAR_END_DRAFT");
+            try (PreparedStatement ps = conn.prepareStatement("UPDATE fiscal_periods SET status='OPEN' WHERE year=? AND month=12")) {
+                ps.setInt(1, year);
+                ps.executeUpdate();
+            }
         }
 
         // 重新啟動（建立新實例，建構子會自動執行 checkAndRecoverOnStartup 啟動檢查並復原）
@@ -1833,5 +1836,414 @@ public class LedgerSystemTest {
         // 管理員重設密碼後可解鎖
         auth.resetPassword(testUser, "BobNewPass123", "admin");
         assertEquals("bob", auth.login(testUser, "BobNewPass123"));
+    }
+
+    // =========================================================================
+    //  R7: 第七輪修正任務（12月正常開放、交易中斷、跨JVM登入鎖定、遷移安全性）
+    // =========================================================================
+
+    @Test
+    @DisplayName("R7-P0-02: 正常開放之12月在系統重啟後仍維持OPEN，且正常傳票仍可建立過帳")
+    void testR7_NormalOpenDecemberMustRemainOpenAfterStartup() throws SQLException {
+        int year = 2074;
+        // 1. 建立年度期間，2. 將 1～11 月設定為 CLOSED，3. 將 12 月設定為 OPEN
+        setupFullYearPeriods(year);
+        // setupFullYearPeriods 建立 1~12 月並將 1~11 關閉，此時 12 月為 OPEN
+        try (Connection conn = DbManager.get();
+             PreparedStatement ps = conn.prepareStatement("SELECT status FROM fiscal_periods WHERE year=? AND month=12")) {
+            ps.setInt(1, year);
+            try (ResultSet rs = ps.executeQuery()) {
+                assertTrue(rs.next());
+                assertEquals("OPEN", rs.getString("status"), "前置條件：12 月應為 OPEN");
+            }
+        }
+
+        YearEndClosingService ye = new YearEndClosingService();
+
+        // 4. 確認該年度沒有未完成的年結復原操作 (closing_recovery 無 IN_PROGRESS 紀錄)
+        try (Connection conn = DbManager.get();
+             PreparedStatement ps = conn.prepareStatement(
+                     "SELECT COUNT(*) FROM closing_recovery WHERE fiscal_year=? AND recovery_status='IN_PROGRESS'")) {
+            ps.setInt(1, year);
+            try (ResultSet rs = ps.executeQuery()) {
+                assertTrue(rs.next());
+                assertEquals(0, rs.getInt(1), "該年度不應有未完成年結復原操作");
+            }
+        }
+
+        // 5. 建立新的 YearEndClosingService，模擬重新啟動
+        YearEndClosingService yeRestart = new YearEndClosingService();
+
+        // 6. 驗證 12 月仍為 OPEN，未被錯誤自動關閉
+        try (Connection conn = DbManager.get();
+             PreparedStatement ps = conn.prepareStatement("SELECT status FROM fiscal_periods WHERE year=? AND month=12")) {
+            ps.setInt(1, year);
+            try (ResultSet rs = ps.executeQuery()) {
+                assertTrue(rs.next());
+                assertEquals("OPEN", rs.getString("status"), "正常營運中的 12 月重啟後必須維持 OPEN，不得被誤鎖！");
+            }
+        }
+
+        // 7. 驗證一般 12 月傳票仍可正常建立與過帳
+        Voucher draft = voucherService.createDraft(year + "-12-15", "正常12月日常營業收入", "Amy", List.of(
+                entry("1101", "8888.00", "0"),
+                entry("4101", "0", "8888.00")
+        ));
+        assertNotNull(draft);
+        assertEquals("DRAFT", draft.status());
+
+        voucherService.post(draft.id(), "Bob");
+        Voucher posted = voucherDao.findById(draft.id()).orElseThrow();
+        assertEquals("POSTED", posted.status(), "正常 12 月傳票應可順利過帳");
+    }
+
+    @Test
+    @DisplayName("R7-P0-03-01: 交易中斷區分測試 — Java Exception 中斷回滾")
+    void testR7_TransactionInterruption_JavaException() throws SQLException {
+        int year = 2075;
+        voucherService.post(
+                voucherService.createDraft(year + "-01-15", "測試收入", "Amy", List.of(
+                        entry("1101", "5000.00", "0"),
+                        entry("4101", "0", "5000.00")
+                )).id(), "Bob");
+        setupFullYearPeriods(year);
+        closingService.closePeriod(year, 12, "Bob");
+
+        YearEndClosingService ye = new YearEndClosingService();
+        YearEndClosingService.simulateFailureAfterYearEndDraftCreate = true;
+        try {
+            assertThrows(RuntimeException.class, () -> ye.createYearEndDraft(year, "Amy"));
+        } finally {
+            YearEndClosingService.simulateFailureAfterYearEndDraftCreate = false;
+        }
+
+        // 驗證 Java 異常導致交易 rollback：不留 partial 年結紀錄，12月不留錯誤 OPEN，無孤立草稿
+        try (Connection conn = DbManager.get()) {
+            try (PreparedStatement ps = conn.prepareStatement("SELECT COUNT(*) FROM year_end_closings WHERE fiscal_year=?")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals(0, rs.getInt(1));
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement("SELECT status FROM fiscal_periods WHERE year=? AND month=12")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals("CLOSED", rs.getString("status"));
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement("SELECT COUNT(*) FROM vouchers WHERE status='DRAFT' AND closing_year=?")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals(0, rs.getInt(1));
+                }
+            }
+        }
+        assertTrue(ye.checkConsistency().isEmpty());
+    }
+
+    @Test
+    @DisplayName("R7-P0-03-02: 交易中斷區分測試 — Connection rollback 回滾")
+    void testR7_TransactionInterruption_ConnectionRollback() throws SQLException {
+        int year = 2076;
+        voucherService.post(
+                voucherService.createDraft(year + "-01-15", "測試收入", "Amy", List.of(
+                        entry("1101", "3000.00", "0"),
+                        entry("4101", "0", "3000.00")
+                )).id(), "Bob");
+        setupFullYearPeriods(year);
+        closingService.closePeriod(year, 12, "Bob");
+
+        try (Connection conn = DbManager.get()) {
+            boolean originAuto = conn.getAutoCommit();
+            conn.setAutoCommit(false);
+            try {
+                // 解鎖 12 月並建立草稿傳票
+                try (PreparedStatement ps = conn.prepareStatement("UPDATE fiscal_periods SET status='OPEN' WHERE year=? AND month=12")) {
+                    ps.setInt(1, year);
+                    ps.executeUpdate();
+                }
+                voucherService.createDraft(conn, year + "-12-31", "未提交年結草稿", "Amy", List.of(
+                        entry("4101", "3000.00", "0"),
+                        entry("3302", "0", "3000.00")
+                ));
+            } finally {
+                // 明確執行 rollback
+                conn.rollback();
+                conn.setAutoCommit(originAuto);
+            }
+        }
+
+        // 驗證 rollback 後完全無殘留
+        try (Connection conn = DbManager.get()) {
+            try (PreparedStatement ps = conn.prepareStatement("SELECT status FROM fiscal_periods WHERE year=? AND month=12")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals("CLOSED", rs.getString("status"), "rollback 後 12 月期間應回復 CLOSED");
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement("SELECT COUNT(*) FROM vouchers WHERE summary='未提交年結草稿'")) {
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals(0, rs.getInt(1), "rollback 後未提交傳票不應存在");
+                }
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("R7-P0-03-03: 交易中斷區分測試 — Connection close 未提交中斷")
+    void testR7_TransactionInterruption_ConnectionCloseWithoutCommit() throws SQLException {
+        int year = 2077;
+        voucherService.post(
+                voucherService.createDraft(year + "-01-15", "測試收入", "Amy", List.of(
+                        entry("1101", "4000.00", "0"),
+                        entry("4101", "0", "4000.00")
+                )).id(), "Bob");
+        setupFullYearPeriods(year);
+        closingService.closePeriod(year, 12, "Bob");
+
+        // 使用獨立連線開啟交易但不 commit 即直接 close
+        try (Connection conn2 = DriverManager.getConnection("jdbc:sqlite:" + TEST_DB_PATH)) {
+            conn2.setAutoCommit(false);
+            try (PreparedStatement ps = conn2.prepareStatement("UPDATE fiscal_periods SET status='OPEN' WHERE year=? AND month=12")) {
+                ps.setInt(1, year);
+                ps.executeUpdate();
+            }
+            long p12Id;
+            try (PreparedStatement ps = conn2.prepareStatement("SELECT id FROM fiscal_periods WHERE year=? AND month=12")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    p12Id = rs.getLong(1);
+                }
+            }
+            try (PreparedStatement ps = conn2.prepareStatement(
+                    "INSERT INTO vouchers (period_id, voucher_no, voucher_date, summary, status, preparer) VALUES (?, 'ABRUPT-001', '2077-12-31', '中斷未提交傳票', 'DRAFT', 'Amy')")) {
+                ps.setLong(1, p12Id);
+                ps.executeUpdate();
+            }
+            // 連線在未 commit 狀態下退出 try-with-resources 自動 close
+        }
+
+        // 重新透過 DbManager 開啟驗證
+        try (Connection conn = DbManager.get()) {
+            try (PreparedStatement ps = conn.prepareStatement("SELECT status FROM fiscal_periods WHERE year=? AND month=12")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals("CLOSED", rs.getString("status"), "連線中斷 close 後 SQLite 應自動回滾未提交異動");
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement("SELECT COUNT(*) FROM vouchers WHERE voucher_no='ABRUPT-001'")) {
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals(0, rs.getInt(1), "未提交憑證不得寫入資料庫");
+                }
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("R7-P0-03-04: 交易中斷區分測試 — 子程序非正常終止 (halt) 後重新啟動復原")
+    void testR7_TransactionInterruption_ProcessAbruptTermination() throws Exception {
+        int year = 2078;
+        voucherService.post(
+                voucherService.createDraft(year + "-01-15", "測試收入", "Amy", List.of(
+                        entry("1101", "6000.00", "0"),
+                        entry("4101", "0", "6000.00")
+                )).id(), "Bob");
+        setupFullYearPeriods(year);
+        closingService.closePeriod(year, 12, "Bob");
+
+        // 確保目前連線釋放鎖定
+        DbManager.closeCurrent();
+
+        // 啟動獨立 JVM 子程序，模擬解鎖 12 月並寫入持久化復原紀錄後突發非正常終止 (halt 42)
+        String javaBin = ProcessHandle.current().info().command()
+                .orElse(System.getProperty("java.home") + "/bin/java");
+        String cp = System.getProperty("java.class.path");
+
+        ProcessBuilder pb = new ProcessBuilder(
+                javaBin,
+                "-cp", cp,
+                "com.ledger.TestProcessHelper",
+                "crash-simulation",
+                TEST_DB_PATH,
+                String.valueOf(year),
+                "12"
+        );
+        pb.inheritIO();
+        Process p = pb.start();
+        boolean finished = p.waitFor(30, java.util.concurrent.TimeUnit.SECONDS);
+        assertTrue(finished, "子程序應在超時前執行完成");
+        assertEquals(42, p.exitValue(), "子程序應以 halt(42) 硬性中斷模擬崩潰退出");
+
+        // 驗證硬崩潰後但在重啟復原前：磁碟上 12 月為 OPEN，且 closing_recovery 留有 IN_PROGRESS 紀錄
+        try (Connection conn = DriverManager.getConnection("jdbc:sqlite:" + TEST_DB_PATH)) {
+            try (PreparedStatement ps = conn.prepareStatement("SELECT status FROM fiscal_periods WHERE year=? AND month=12")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals("OPEN", rs.getString("status"), "崩潰時磁碟狀態確實被置為 OPEN");
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT recovery_status FROM closing_recovery WHERE fiscal_year=? AND action_type='YEAR_END_DRAFT'")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals("IN_PROGRESS", rs.getString("recovery_status"), "持久化復原紀錄在真正崩潰後仍完好存在");
+                }
+            }
+        }
+
+        // 模擬系統重啟：初始化 YearEndClosingService（自動執行 checkAndRecoverOnStartup）
+        YearEndClosingService ye = new YearEndClosingService();
+
+        // 驗證啟動復原生效：12 月被安全鎖回 CLOSED，且復原紀錄標記為 RECOVERED
+        try (Connection conn = DbManager.get()) {
+            try (PreparedStatement ps = conn.prepareStatement("SELECT status FROM fiscal_periods WHERE year=? AND month=12")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals("CLOSED", rs.getString("status"), "啟動復原程序後 12 月應成功恢復為 CLOSED！");
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT recovery_status FROM closing_recovery WHERE fiscal_year=? AND action_type='YEAR_END_DRAFT'")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals("RECOVERED", rs.getString("recovery_status"), "復原紀錄應更新為 RECOVERED");
+                }
+            }
+        }
+
+        // 復原後能順利完成正常年度結帳
+        List<Long> closeIds = ye.closeYear(year, "Amy", "Bob");
+        assertFalse(closeIds.isEmpty(), "復原後年度應可正常順利完成年結");
+    }
+
+    @Test
+    @DisplayName("R7-P1-01: 跨獨立 JVM 程序並行登入失敗，累計鎖定不被覆蓋且重啟後持久存在")
+    void testR7_MultiJvmConcurrentLoginLockout() throws Exception {
+        AuthService auth = new AuthService();
+        String testUser = "bob";
+
+        // 先重設確認密碼為已知狀態
+        auth.resetPassword(testUser, "BobInitial123", "admin");
+
+        String javaBin = ProcessHandle.current().info().command()
+                .orElse(System.getProperty("java.home") + "/bin/java");
+        String cp = System.getProperty("java.class.path");
+
+        // 同時啟動 2 個獨立的 JVM 程序，各執行 3 次登入失敗，合計 6 次（門檻為 5 次）
+        ProcessBuilder pb1 = new ProcessBuilder(
+                javaBin, "-cp", cp, "com.ledger.TestProcessHelper", "auth-fail", testUser, "3"
+        );
+        ProcessBuilder pb2 = new ProcessBuilder(
+                javaBin, "-cp", cp, "com.ledger.TestProcessHelper", "auth-fail", testUser, "3"
+        );
+
+        Process p1 = pb1.start();
+        Process p2 = pb2.start();
+
+        assertTrue(p1.waitFor(30, java.util.concurrent.TimeUnit.SECONDS));
+        assertTrue(p2.waitFor(30, java.util.concurrent.TimeUnit.SECONDS));
+        assertEquals(0, p1.exitValue(), "程序 1 應成功執行");
+        assertEquals(0, p2.exitValue(), "程序 2 應成功執行");
+
+        // 驗證跨程序累計達到鎖定門檻：輸入正確密碼也被拒絕
+        BusinessException lockEx = assertThrows(BusinessException.class, () ->
+                auth.login(testUser, "BobInitial123"));
+        assertTrue(lockEx.getMessage().contains("登入失敗次數過多"), "跨程序並行失敗累計達到 5 次後，正確密碼必須被拒絕: " + lockEx.getMessage());
+
+        // 驗證重啟後鎖定仍然存在（新實例）
+        AuthService authRestarted = new AuthService();
+        BusinessException stillLocked = assertThrows(BusinessException.class, () ->
+                authRestarted.login(testUser, "BobInitial123"));
+        assertTrue(stillLocked.getMessage().contains("登入失敗次數過多"), "重啟後帳號鎖定狀態必須依然持久存在: " + stillLocked.getMessage());
+
+        // 管理員重設密碼後成功解鎖
+        authRestarted.resetPassword(testUser, "BobNewPass789", "admin");
+        assertEquals("bob", authRestarted.login(testUser, "BobNewPass789"));
+    }
+
+    @Test
+    @DisplayName("R7-P1-02-01: 舊版資料庫結構安全升級，會計資料、傳票與年結歷史不丟失")
+    void testR7_DatabaseMigration_LegacyUpgradeSafety() throws SQLException {
+        Path legacyDbPath = Paths.get("target/legacy_upgrade_test.db");
+        try { Files.deleteIfExists(legacyDbPath); } catch (Exception ignored) {}
+
+        String url = "jdbc:sqlite:" + legacyDbPath.toString().replace('\\', '/');
+
+        // 建立舊版結構（缺少 closing_sequence、具有 fiscal_year UNIQUE）
+        try (Connection conn = DriverManager.getConnection(url)) {
+            try (Statement st = conn.createStatement()) {
+                st.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY, code TEXT, name TEXT, type TEXT)");
+                st.execute("CREATE TABLE vouchers (id INTEGER PRIMARY KEY, period_id INTEGER, voucher_no TEXT, voucher_date TEXT, summary TEXT, status TEXT, preparer TEXT, reviewer TEXT, reversed_id INTEGER)");
+                st.execute("CREATE TABLE year_end_closings (" +
+                        "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+                        "fiscal_year INTEGER NOT NULL UNIQUE, " +
+                        "voucher_id INTEGER, " +
+                        "reverse_voucher_id INTEGER, " +
+                        "status TEXT, " +
+                        "idempotency_key TEXT, " +
+                        "created_by TEXT, " +
+                        "reviewed_by TEXT, " +
+                        "created_at TEXT DEFAULT (datetime('now','localtime')), " +
+                        "fail_reason TEXT)");
+                // 寫入舊版歷史資料
+                st.execute("INSERT INTO year_end_closings (fiscal_year, voucher_id, status, idempotency_key, created_by, reviewed_by) " +
+                        "VALUES (2024, 101, 'POSTED', 'KEY-LEGACY-2024', 'Amy', 'Bob')");
+            }
+
+            // 執行升級遷移
+            YearEndClosingService ye = new YearEndClosingService();
+            ye.ensureTable(conn);
+
+            // 驗證升級後舊資料完整保留，且新增了 closing_sequence 欄位預設值為 1
+            try (PreparedStatement ps = conn.prepareStatement("SELECT fiscal_year, closing_sequence, status, voucher_id, created_by FROM year_end_closings WHERE fiscal_year=2024")) {
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next(), "舊版歷史紀錄必須被安全保留");
+                    assertEquals(2024, rs.getInt("fiscal_year"));
+                    assertEquals(1, rs.getInt("closing_sequence"));
+                    assertEquals("POSTED", rs.getString("status"));
+                    assertEquals(101L, rs.getLong("voucher_id"));
+                    assertEquals("Amy", rs.getString("created_by"));
+                }
+            }
+
+            // 驗證同年度現在可支援多版本歷史（插入 sequence 2 不再因 fiscal_year UNIQUE 報錯）
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO year_end_closings (fiscal_year, closing_sequence, closing_version, voucher_id, status, idempotency_key, created_by) " +
+                    "VALUES (2024, 2, 2, 102, 'REVERSED', 'KEY-LEGACY-2024-V2', 'Amy')")) {
+                assertEquals(1, ps.executeUpdate(), "升級後同年度必須支援多次結帳歷史紀錄");
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("R7-P1-02-02: 資料庫遷移冪等性 — 重複執行確保安全無副作用")
+    void testR7_DatabaseMigration_IdempotentRepeatedRuns() throws SQLException {
+        try (Connection conn = DbManager.get()) {
+            YearEndClosingService ye = new YearEndClosingService();
+            // 重複執行 5 次遷移，應均平穩執行且不拋異常、不重複新增欄位
+            for (int i = 0; i < 5; i++) {
+                assertDoesNotThrow(() -> ye.ensureTable(conn), "重複執行 ensureTable 必須完全冪等安全");
+            }
+
+            // 驗證資料表完整性
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery("PRAGMA table_info(year_end_closings)")) {
+                int colCount = 0;
+                while (rs.next()) colCount++;
+                assertTrue(colCount >= 10, "year_end_closings 欄位數量應齊全");
+            }
+        }
     }
 }

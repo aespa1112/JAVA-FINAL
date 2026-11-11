@@ -52,49 +52,59 @@ public class YearEndClosingService {
     }
 
     public void ensureTable(Connection conn) throws SQLException {
-        try (Statement st = conn.createStatement()) {
-            st.execute(
-                "CREATE TABLE IF NOT EXISTS year_end_closings (" +
-                "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
-                "fiscal_year INTEGER NOT NULL, " +
-                "closing_sequence INTEGER NOT NULL DEFAULT 1, " +
-                "closing_version INTEGER NOT NULL DEFAULT 1, " +
-                "voucher_id INTEGER REFERENCES vouchers(id), " +
-                "reverse_voucher_id INTEGER REFERENCES vouchers(id), " +
-                "status TEXT NOT NULL CHECK (status IN ('PENDING_DRAFT','DRAFT','POSTED','REOPEN_PENDING','REOPEN_DRAFT','REVERSED','REOPENED','FAILED')), " +
-                "idempotency_key TEXT NOT NULL, " +
-                "created_by TEXT NOT NULL, " +
-                "reviewed_by TEXT, " +
-                "created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')), " +
-                "reviewed_at TEXT, " +
-                "closed_at TEXT, " +
-                "fail_reason TEXT, " +
-                "reopen_initiated_by TEXT, " +
-                "reopen_initiated_at TEXT, " +
-                "reopen_reviewed_by TEXT, " +
-                "reopen_reviewed_at TEXT, " +
-                "reopen_reason TEXT, " +
-                "UNIQUE(fiscal_year, closing_sequence))"
-            );
+        boolean ac = conn.getAutoCommit();
+        conn.setAutoCommit(false);
+        try {
+            // 1. 建立年結主表與持久化復原表（若不存在）
+            try (Statement st = conn.createStatement()) {
+                st.execute(
+                    "CREATE TABLE IF NOT EXISTS year_end_closings (" +
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+                    "fiscal_year INTEGER NOT NULL, " +
+                    "closing_sequence INTEGER NOT NULL DEFAULT 1, " +
+                    "closing_version INTEGER NOT NULL DEFAULT 1, " +
+                    "voucher_id INTEGER REFERENCES vouchers(id), " +
+                    "reverse_voucher_id INTEGER REFERENCES vouchers(id), " +
+                    "status TEXT NOT NULL CHECK (status IN ('PENDING_DRAFT','DRAFT','POSTED','REOPEN_PENDING','REOPEN_DRAFT','REVERSED','REOPENED','FAILED')), " +
+                    "idempotency_key TEXT NOT NULL, " +
+                    "created_by TEXT NOT NULL, " +
+                    "reviewed_by TEXT, " +
+                    "created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')), " +
+                    "reviewed_at TEXT, " +
+                    "closed_at TEXT, " +
+                    "fail_reason TEXT, " +
+                    "reopen_initiated_by TEXT, " +
+                    "reopen_initiated_at TEXT, " +
+                    "reopen_reviewed_by TEXT, " +
+                    "reopen_reviewed_at TEXT, " +
+                    "reopen_reason TEXT, " +
+                    "UNIQUE(fiscal_year, closing_sequence))"
+                );
 
-            st.execute(
-                "CREATE TABLE IF NOT EXISTS closing_recovery (" +
-                "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
-                "fiscal_year INTEGER NOT NULL, " +
-                "month INTEGER NOT NULL, " +
-                "original_status TEXT NOT NULL, " +
-                "action TEXT NOT NULL, " +
-                "state TEXT NOT NULL CHECK (state IN ('IN_PROGRESS','COMPLETED','RECOVERED')), " +
-                "created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')))"
-            );
-        }
+                st.execute(
+                    "CREATE TABLE IF NOT EXISTS closing_recovery (" +
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+                    "operation_id TEXT NOT NULL UNIQUE, " +
+                    "fiscal_year INTEGER NOT NULL, " +
+                    "month INTEGER NOT NULL, " +
+                    "original_status TEXT NOT NULL, " +
+                    "action_type TEXT NOT NULL, " +
+                    "recovery_status TEXT NOT NULL CHECK (recovery_status IN ('IN_PROGRESS','COMPLETED','RECOVERED')), " +
+                    "created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')), " +
+                    "recovered_at TEXT)"
+                );
+            }
 
-        // 舊表升級遷移：若有 fiscal_year UNIQUE 或缺少 closing_sequence，安全平移資料並改為 (fiscal_year, closing_sequence) 唯一
-        try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("SELECT sql FROM sqlite_master WHERE type='table' AND name='year_end_closings'")) {
-            if (rs.next()) {
-                String ddl = rs.getString(1);
-                if (ddl != null && (ddl.contains("fiscal_year INTEGER NOT NULL UNIQUE") || !ddl.contains("closing_sequence"))) {
+            // 2. 檢查 year_end_closings 結構遷移（區分欄位已存在與真正遷移失敗）
+            java.util.Set<String> yeCols = getTableColumns(conn, "year_end_closings");
+            String ddl = null;
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery("SELECT sql FROM sqlite_master WHERE type='table' AND name='year_end_closings'")) {
+                if (rs.next()) ddl = rs.getString(1);
+            }
+
+            if (ddl != null && (ddl.contains("fiscal_year INTEGER NOT NULL UNIQUE") || !yeCols.contains("closing_sequence"))) {
+                try (Statement st = conn.createStatement()) {
                     st.execute("CREATE TABLE year_end_closings_v3 (" +
                         "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
                         "fiscal_year INTEGER NOT NULL, " +
@@ -116,41 +126,88 @@ public class YearEndClosingService {
                         "reopen_reviewed_at TEXT, " +
                         "reopen_reason TEXT, " +
                         "UNIQUE(fiscal_year, closing_sequence))");
-                    st.execute("INSERT INTO year_end_closings_v3 (id, fiscal_year, closing_sequence, closing_version, voucher_id, reverse_voucher_id, status, idempotency_key, created_by, reviewed_by, created_at, reviewed_at, closed_at, fail_reason, reopen_initiated_by, reopen_initiated_at, reopen_reviewed_by, reopen_reviewed_at, reopen_reason) " +
-                        "SELECT id, fiscal_year, 1, 1, voucher_id, reverse_voucher_id, status, idempotency_key, created_by, reviewed_by, created_at, reviewed_at, closed_at, fail_reason, reopen_initiated_by, reopen_initiated_at, reopen_reviewed_by, reopen_reviewed_at, reopen_reason FROM year_end_closings");
+
+                    String copySql = "INSERT INTO year_end_closings_v3 (" +
+                        "id, fiscal_year, closing_sequence, closing_version, voucher_id, reverse_voucher_id, " +
+                        "status, idempotency_key, created_by, reviewed_by, created_at, reviewed_at, closed_at, " +
+                        "fail_reason, reopen_initiated_by, reopen_initiated_at, reopen_reviewed_by, reopen_reviewed_at, reopen_reason) " +
+                        "SELECT id, fiscal_year, " +
+                        (yeCols.contains("closing_sequence") ? "closing_sequence" : "1") + ", " +
+                        (yeCols.contains("closing_version") ? "closing_version" : "1") + ", " +
+                        (yeCols.contains("voucher_id") ? "voucher_id" : "NULL") + ", " +
+                        (yeCols.contains("reverse_voucher_id") ? "reverse_voucher_id" : "NULL") + ", " +
+                        (yeCols.contains("status") ? "status" : "'DRAFT'") + ", " +
+                        (yeCols.contains("idempotency_key") ? "idempotency_key" : "('MIG-' || id)") + ", " +
+                        (yeCols.contains("created_by") ? "created_by" : "'SYSTEM'") + ", " +
+                        (yeCols.contains("reviewed_by") ? "reviewed_by" : "NULL") + ", " +
+                        (yeCols.contains("created_at") ? "created_at" : "datetime('now','localtime')") + ", " +
+                        (yeCols.contains("reviewed_at") ? "reviewed_at" : "NULL") + ", " +
+                        (yeCols.contains("closed_at") ? "closed_at" : "NULL") + ", " +
+                        (yeCols.contains("fail_reason") ? "fail_reason" : "NULL") + ", " +
+                        (yeCols.contains("reopen_initiated_by") ? "reopen_initiated_by" : "NULL") + ", " +
+                        (yeCols.contains("reopen_initiated_at") ? "reopen_initiated_at" : "NULL") + ", " +
+                        (yeCols.contains("reopen_reviewed_by") ? "reopen_reviewed_by" : "NULL") + ", " +
+                        (yeCols.contains("reopen_reviewed_at") ? "reopen_reviewed_at" : "NULL") + ", " +
+                        (yeCols.contains("reopen_reason") ? "reopen_reason" : "NULL") +
+                        " FROM year_end_closings";
+                    st.execute(copySql);
                     st.execute("DROP TABLE year_end_closings");
                     st.execute("ALTER TABLE year_end_closings_v3 RENAME TO year_end_closings");
                 }
+                yeCols = getTableColumns(conn, "year_end_closings");
             }
-        } catch (SQLException ignored) {}
 
-        for (String alter : List.of(
-                "ALTER TABLE year_end_closings ADD COLUMN closing_sequence INTEGER NOT NULL DEFAULT 1",
-                "ALTER TABLE year_end_closings ADD COLUMN closing_version INTEGER NOT NULL DEFAULT 1",
-                "ALTER TABLE year_end_closings ADD COLUMN reverse_voucher_id INTEGER",
-                "ALTER TABLE year_end_closings ADD COLUMN idempotency_key TEXT",
-                "ALTER TABLE year_end_closings ADD COLUMN fail_reason TEXT",
-                "ALTER TABLE year_end_closings ADD COLUMN reopen_initiated_by TEXT",
-                "ALTER TABLE year_end_closings ADD COLUMN reopen_initiated_at TEXT",
-                "ALTER TABLE year_end_closings ADD COLUMN reopen_reviewed_by TEXT",
-                "ALTER TABLE year_end_closings ADD COLUMN reopen_reviewed_at TEXT",
-                "ALTER TABLE year_end_closings ADD COLUMN reopen_reason TEXT"
-        )) {
+            safeAddColumn(conn, "year_end_closings", "closing_sequence", "INTEGER NOT NULL DEFAULT 1");
+            safeAddColumn(conn, "year_end_closings", "closing_version", "INTEGER NOT NULL DEFAULT 1");
+            safeAddColumn(conn, "year_end_closings", "reverse_voucher_id", "INTEGER");
+            safeAddColumn(conn, "year_end_closings", "idempotency_key", "TEXT");
+            safeAddColumn(conn, "year_end_closings", "fail_reason", "TEXT");
+            safeAddColumn(conn, "year_end_closings", "reopen_initiated_by", "TEXT");
+            safeAddColumn(conn, "year_end_closings", "reopen_initiated_at", "TEXT");
+            safeAddColumn(conn, "year_end_closings", "reopen_reviewed_by", "TEXT");
+            safeAddColumn(conn, "year_end_closings", "reopen_reviewed_at", "TEXT");
+            safeAddColumn(conn, "year_end_closings", "reopen_reason", "TEXT");
+
+            // 3. 檢查 closing_recovery 結構升級（升級 operation_id 欄位）
+            java.util.Set<String> recCols = getTableColumns(conn, "closing_recovery");
+            if (!recCols.contains("operation_id")) {
+                try (Statement st = conn.createStatement()) {
+                    st.execute("CREATE TABLE closing_recovery_new (" +
+                        "id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+                        "operation_id TEXT NOT NULL UNIQUE, " +
+                        "fiscal_year INTEGER NOT NULL, " +
+                        "month INTEGER NOT NULL, " +
+                        "original_status TEXT NOT NULL, " +
+                        "action_type TEXT NOT NULL, " +
+                        "recovery_status TEXT NOT NULL CHECK (recovery_status IN ('IN_PROGRESS','COMPLETED','RECOVERED')), " +
+                        "created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')), " +
+                        "recovered_at TEXT)");
+                    st.execute("INSERT INTO closing_recovery_new (id, operation_id, fiscal_year, month, original_status, action_type, recovery_status, created_at) " +
+                        "SELECT id, 'LEGACY-' || id, fiscal_year, month, original_status, " +
+                        (recCols.contains("action_type") ? "action_type" : (recCols.contains("action") ? "action" : "'YEAR_END_DRAFT'")) + ", " +
+                        (recCols.contains("recovery_status") ? "recovery_status" : (recCols.contains("state") ? "state" : "'COMPLETED'")) + ", " +
+                        "created_at FROM closing_recovery");
+                    st.execute("DROP TABLE closing_recovery");
+                    st.execute("ALTER TABLE closing_recovery_new RENAME TO closing_recovery");
+                }
+            }
+
+            // 4. 檢查 vouchers 欄位
+            safeAddColumn(conn, "vouchers", "voucher_type", "TEXT NOT NULL DEFAULT 'NORMAL'");
+            safeAddColumn(conn, "vouchers", "closing_year", "INTEGER");
+
+            // 5. 索引安全建立
             try (Statement st = conn.createStatement()) {
-                st.execute(alter);
-            } catch (SQLException ignored) {}
+                st.execute("CREATE INDEX IF NOT EXISTS idx_year_end_fiscal ON year_end_closings(fiscal_year, closing_sequence)");
+            }
+
+            conn.commit();
+        } catch (SQLException e) {
+            conn.rollback();
+            throw new SQLException("資料庫年結相關表格遷移升級失敗: " + e.getMessage(), e);
+        } finally {
+            conn.setAutoCommit(ac);
         }
-
-        try (Statement st = conn.createStatement()) {
-            st.execute("CREATE INDEX IF NOT EXISTS idx_year_end_fiscal ON year_end_closings(fiscal_year, closing_sequence)");
-        } catch (SQLException ignored) {}
-
-        try (Statement st = conn.createStatement()) {
-            st.execute("ALTER TABLE vouchers ADD COLUMN voucher_type TEXT NOT NULL DEFAULT 'NORMAL'");
-        } catch (SQLException ignored) {}
-        try (Statement st = conn.createStatement()) {
-            st.execute("ALTER TABLE vouchers ADD COLUMN closing_year INTEGER");
-        } catch (SQLException ignored) {}
     }
 
     public boolean isRetryable(String status) {
@@ -769,61 +826,73 @@ public class YearEndClosingService {
         try (Connection conn = DbManager.get()) {
             ensureTable(conn);
 
-            // 1. 處理持久化復原紀錄 closing_recovery
-            try (Statement st = conn.createStatement();
-                 ResultSet rs = st.executeQuery(
-                         "SELECT id, fiscal_year, month, original_status FROM closing_recovery WHERE state = 'IN_PROGRESS'")) {
-                List<RecoveryItem> list = new ArrayList<>();
-                while (rs.next()) {
-                    list.add(new RecoveryItem(rs.getLong("id"), rs.getInt("fiscal_year"), rs.getInt("month"), rs.getString("original_status")));
+            boolean ac = conn.getAutoCommit();
+            conn.setAutoCommit(false);
+            try {
+                // 依據明確的持久化操作識別紀錄 (closing_recovery) 進行受控復原，移除僅依月份狀態推定崩潰的猜測式邏輯
+                String sql = "SELECT id, operation_id, fiscal_year, month, original_status, action_type " +
+                             "FROM closing_recovery WHERE recovery_status = 'IN_PROGRESS' ORDER BY id ASC";
+                List<RecoveryItem> inProgressList = new ArrayList<>();
+                try (Statement st = conn.createStatement();
+                     ResultSet rs = st.executeQuery(sql)) {
+                    while (rs.next()) {
+                        inProgressList.add(new RecoveryItem(
+                                rs.getLong("id"),
+                                rs.getString("operation_id"),
+                                rs.getInt("fiscal_year"),
+                                rs.getInt("month"),
+                                rs.getString("original_status"),
+                                rs.getString("action_type")
+                        ));
+                    }
                 }
-                for (RecoveryItem item : list) {
-                    boolean yearPosted = false;
+
+                for (RecoveryItem item : inProgressList) {
+                    // 已完成年結不得被復原程式解除鎖定
+                    boolean yearCompleted = false;
                     try (PreparedStatement ps = conn.prepareStatement(
                             "SELECT 1 FROM year_end_closings WHERE fiscal_year=? AND status='POSTED'")) {
                         ps.setInt(1, item.year);
-                        try (ResultSet psRs = ps.executeQuery()) {
-                            yearPosted = psRs.next();
+                        try (ResultSet rs = ps.executeQuery()) {
+                            yearCompleted = rs.next();
                         }
                     }
-                    if (!yearPosted) {
-                        try (PreparedStatement ps = conn.prepareStatement(
-                                "UPDATE fiscal_periods SET status=? WHERE year=? AND month=?")) {
-                            ps.setString(1, item.originalStatus);
-                            ps.setInt(2, item.year);
-                            ps.setInt(3, item.month);
-                            repaired += ps.executeUpdate();
-                        }
-                    }
-                    try (PreparedStatement ps = conn.prepareStatement(
-                            "UPDATE closing_recovery SET state='RECOVERED' WHERE id=?")) {
-                        ps.setLong(1, item.id);
-                        ps.executeUpdate();
-                    }
-                }
-            } catch (SQLException ignored) {}
 
-            // 2. 掃描 fiscal_periods：若 12 月為 OPEN，1~11 月全為 CLOSED，且該年度無有效 POSTED 年結：
-            // 恢復原期間狀態（鎖回 CLOSED），保護期間不因崩潰異常敞開
-            try (Statement st = conn.createStatement();
-                 ResultSet rs = st.executeQuery(
-                         "SELECT p.year FROM fiscal_periods p " +
-                         "WHERE p.month = 12 AND p.status = 'OPEN' " +
-                         "AND (SELECT COUNT(*) FROM fiscal_periods p2 WHERE p2.year = p.year AND p2.month < 12 AND p2.status = 'CLOSED') = 11 " +
-                         "AND NOT EXISTS (SELECT 1 FROM year_end_closings y WHERE y.fiscal_year = p.year AND y.status = 'POSTED')")) {
-                List<Integer> yearsToFix = new ArrayList<>();
-                while (rs.next()) {
-                    yearsToFix.add(rs.getInt(1));
-                }
-                for (int y : yearsToFix) {
-                    try (PreparedStatement ps = conn.prepareStatement(
-                            "UPDATE fiscal_periods SET status='CLOSED' WHERE year=? AND month=12")) {
-                        ps.setInt(1, y);
-                        repaired += ps.executeUpdate();
+                    if (yearCompleted) {
+                        try (PreparedStatement ps = conn.prepareStatement(
+                                "UPDATE closing_recovery SET recovery_status='COMPLETED', recovered_at=datetime('now','localtime') WHERE id=?")) {
+                            ps.setLong(1, item.id);
+                            ps.executeUpdate();
+                        }
+                    } else {
+                        // 只能復原確定屬於未完成年結的操作
+                        if ("YEAR_END_DRAFT".equals(item.actionType) || "YEAR_END_CLOSE".equals(item.actionType)) {
+                            try (PreparedStatement ps = conn.prepareStatement(
+                                    "UPDATE fiscal_periods SET status=? WHERE year=? AND month=?")) {
+                                ps.setString(1, item.originalStatus);
+                                ps.setInt(2, item.year);
+                                ps.setInt(3, item.month);
+                                repaired += ps.executeUpdate();
+                            }
+
+                            try (PreparedStatement ps = conn.prepareStatement(
+                                    "UPDATE closing_recovery SET recovery_status='RECOVERED', recovered_at=datetime('now','localtime') WHERE id=?")) {
+                                ps.setLong(1, item.id);
+                                ps.executeUpdate();
+                            }
+
+                            auditDao.log(conn, "STARTUP_RECOVERY", "fiscal_periods", (long) item.year, "SYSTEM",
+                                    "OPEN", "Restored month " + item.month + " to " + item.originalStatus + " for unfinished op " + item.operationId);
+                        }
                     }
-                    auditDao.log(conn, "STARTUP_RECOVERY", "fiscal_periods", (long) y, "SYSTEM",
-                            "OPEN", "Restored month 12 to CLOSED due to uncompleted closing");
                 }
+
+                conn.commit();
+            } catch (Exception e) {
+                conn.rollback();
+                throw e;
+            } finally {
+                conn.setAutoCommit(ac);
             }
         } catch (SQLException e) {
             System.err.println("WARN: checkAndRecoverOnStartup 異常: " + e.getMessage());
@@ -833,18 +902,23 @@ public class YearEndClosingService {
 
     private static class RecoveryItem {
         final long id;
+        final String operationId;
         final int year;
         final int month;
         final String originalStatus;
-        RecoveryItem(long id, int year, int month, String originalStatus) {
+        final String actionType;
+
+        RecoveryItem(long id, String operationId, int year, int month, String originalStatus, String actionType) {
             this.id = id;
+            this.operationId = operationId;
             this.year = year;
             this.month = month;
             this.originalStatus = originalStatus;
+            this.actionType = actionType;
         }
     }
 
-    public record YearEndClosingRecord(
+        public record YearEndClosingRecord(
             long id,
             int fiscalYear,
             int closingSequence,
@@ -965,24 +1039,66 @@ public class YearEndClosingService {
         }
     }
 
-    private void recordRecoveryIntent(Connection conn, int year, int month, String originalStatus, String action) throws SQLException {
+    public void recordRecoveryIntent(Connection conn, String operationId, int year, int month, String originalStatus, String actionType) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement(
-                "INSERT INTO closing_recovery (fiscal_year, month, original_status, action, state) VALUES (?, ?, ?, ?, 'IN_PROGRESS')")) {
-            ps.setInt(1, year);
-            ps.setInt(2, month);
-            ps.setString(3, originalStatus);
-            ps.setString(4, action);
+                "INSERT INTO closing_recovery (operation_id, fiscal_year, month, original_status, action_type, recovery_status, created_at) " +
+                "VALUES (?, ?, ?, ?, ?, 'IN_PROGRESS', datetime('now','localtime'))")) {
+            ps.setString(1, operationId);
+            ps.setInt(2, year);
+            ps.setInt(3, month);
+            ps.setString(4, originalStatus);
+            ps.setString(5, actionType);
             ps.executeUpdate();
         }
     }
 
-    private void completeRecoveryIntent(Connection conn, int year, int month) throws SQLException {
+    public void recordRecoveryIntent(Connection conn, int year, int month, String originalStatus, String actionType) throws SQLException {
+        String opId = "REC-" + year + "-" + UUID.randomUUID().toString().substring(0, 8);
+        recordRecoveryIntent(conn, opId, year, month, originalStatus, actionType);
+    }
+
+    public void completeRecoveryIntent(Connection conn, String operationId) throws SQLException {
         try (PreparedStatement ps = conn.prepareStatement(
-                "UPDATE closing_recovery SET state='COMPLETED' WHERE fiscal_year=? AND month=? AND state='IN_PROGRESS'")) {
+                "UPDATE closing_recovery SET recovery_status='COMPLETED', recovered_at=datetime('now','localtime') " +
+                "WHERE operation_id=? AND recovery_status='IN_PROGRESS'")) {
+            ps.setString(1, operationId);
+            ps.executeUpdate();
+        }
+    }
+
+    public void completeRecoveryIntent(Connection conn, int year, int month) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE closing_recovery SET recovery_status='COMPLETED', recovered_at=datetime('now','localtime') " +
+                "WHERE fiscal_year=? AND month=? AND recovery_status='IN_PROGRESS'")) {
             ps.setInt(1, year);
             ps.setInt(2, month);
             ps.executeUpdate();
         }
+    }
+
+    private void safeAddColumn(Connection conn, String table, String column, String definition) throws SQLException {
+        java.util.Set<String> cols = getTableColumns(conn, table);
+        if (!cols.contains(column.toLowerCase())) {
+            try (Statement st = conn.createStatement()) {
+                st.execute("ALTER TABLE " + table + " ADD COLUMN " + column + " " + definition);
+            } catch (SQLException e) {
+                java.util.Set<String> recheck = getTableColumns(conn, table);
+                if (!recheck.contains(column.toLowerCase())) {
+                    throw new SQLException("資料表 [" + table + "] 結構升級失敗，無法新增欄位 [" + column + "]: " + e.getMessage(), e);
+                }
+            }
+        }
+    }
+
+    private java.util.Set<String> getTableColumns(Connection conn, String table) throws SQLException {
+        java.util.Set<String> set = new java.util.HashSet<>();
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("PRAGMA table_info(" + table + ")")) {
+            while (rs.next()) {
+                set.add(rs.getString("name").toLowerCase());
+            }
+        }
+        return set;
     }
 
     private void assertTwelveMonthsClosed(Connection conn, int year) throws SQLException {
