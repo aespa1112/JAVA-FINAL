@@ -2246,4 +2246,87 @@ public class LedgerSystemTest {
             }
         }
     }
+
+    @Test
+    @DisplayName("R7-P1-02-03: system_meta schema_version 事務原子回滾保證測試")
+    void testR7_SystemMetaSchemaVersionRollbackGuarantee() throws SQLException {
+        Path testMetaDb = Paths.get("target/test_meta_version.db");
+        try { Files.deleteIfExists(testMetaDb); } catch (Exception ignored) {}
+        String url = "jdbc:sqlite:" + testMetaDb.toString().replace('\\', '/');
+
+        try (Connection conn = DriverManager.getConnection(url)) {
+            DbManager.applyPragmas(conn);
+            DbManager.ensureSystemTables(conn);
+            DbManager.setSchemaVersion(conn, 2);
+            assertEquals(2, DbManager.getSchemaVersion(conn));
+
+            // 模擬在升級交易中寫入版本 3，但後續操作失敗引發 rollback
+            boolean originAuto = conn.getAutoCommit();
+            conn.setAutoCommit(false);
+            try {
+                DbManager.setSchemaVersion(conn, 3);
+                // 模擬中途失敗拋出異常
+                throw new SQLException("模擬遷移中途失敗");
+            } catch (Exception e) {
+                conn.rollback();
+            } finally {
+                conn.setAutoCommit(originAuto);
+            }
+
+            // 驗證 system_meta 之 schema_version 100% 隨事務回滾為 2，並未殘留 3
+            assertEquals(2, DbManager.getSchemaVersion(conn),
+                    "遷移失敗回滾後，system_meta 記錄之 schema_version 必須 100% 隨交易回滾為 2！");
+
+            // 隨後執行成功遷移
+            conn.setAutoCommit(false);
+            DbManager.setSchemaVersion(conn, 3);
+            conn.commit();
+            conn.setAutoCommit(originAuto);
+
+            assertEquals(3, DbManager.getSchemaVersion(conn),
+                    "成功提交後，schema_version 應正確更新為 3");
+        }
+    }
+
+    @Test
+    @DisplayName("R7-P1-02-04: 多租戶連線管理與帳套資料庫隔離測試")
+    void testR7_MultiTenantConnectionIsolation() throws SQLException {
+        String tenantA = "tenant_alpha";
+        String tenantB = "tenant_beta";
+
+        Path dbA = Paths.get(DbManager.resolveTenantDbPath(tenantA));
+        Path dbB = Paths.get(DbManager.resolveTenantDbPath(tenantB));
+        try { Files.deleteIfExists(dbA); } catch (Exception ignored) {}
+        try { Files.deleteIfExists(dbB); } catch (Exception ignored) {}
+
+        try {
+            // 獲取 Tenant A 專屬連線並設定專屬 client_id
+            Connection connA = DbManager.getForTenant(tenantA);
+            DbManager.setClientId(connA, "CLIENT-ALPHA-001");
+
+            // 獲取 Tenant B 專屬連線並設定專屬 client_id
+            Connection connB = DbManager.getForTenant(tenantB);
+            DbManager.setClientId(connB, "CLIENT-BETA-002");
+
+            // 驗證各自讀取互不干擾，資料完全隔離
+            assertEquals("CLIENT-ALPHA-001", DbManager.getClientId(connA));
+            assertEquals("CLIENT-BETA-002", DbManager.getClientId(connB));
+
+            // 測試 ThreadLocal 租戶路由模式
+            DbManager.setCurrentTenant(tenantA);
+            Connection routedA = DbManager.get();
+            assertEquals("CLIENT-ALPHA-001", DbManager.getClientId(routedA));
+
+            DbManager.setCurrentTenant(tenantB);
+            Connection routedB = DbManager.get();
+            assertEquals("CLIENT-BETA-002", DbManager.getClientId(routedB));
+
+            DbManager.clearCurrentTenant();
+        } finally {
+            DbManager.clearCurrentTenant();
+            DbManager.closeTenant(tenantA);
+            DbManager.closeTenant(tenantB);
+            DbManager.closeAllTenants();
+        }
+    }
 }

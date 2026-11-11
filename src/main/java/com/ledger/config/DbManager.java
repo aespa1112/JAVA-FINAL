@@ -16,6 +16,8 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 public final class DbManager {
 
@@ -31,11 +33,17 @@ public final class DbManager {
 
     private static String currentDbPath = "data/client_A.db";
     private static Connection currentConnection;
+    private static final Map<String, Connection> tenantConnections = new ConcurrentHashMap<>();
+    private static final ThreadLocal<String> currentTenant = new ThreadLocal<>();
 
     private DbManager() {
     }
 
     public static synchronized Connection get() throws SQLException {
+        String tenant = currentTenant.get();
+        if (tenant != null && !tenant.isBlank()) {
+            return getForTenant(tenant);
+        }
         if (currentConnection == null || currentConnection.isClosed()) {
             openConnection(currentDbPath);
         }
@@ -56,6 +64,79 @@ public final class DbManager {
                     }
                 }
         );
+    }
+
+    public static void setCurrentTenant(String tenantId) {
+        currentTenant.set(tenantId);
+    }
+
+    public static String getCurrentTenant() {
+        return currentTenant.get();
+    }
+
+    public static void clearCurrentTenant() {
+        currentTenant.remove();
+    }
+
+    public static synchronized Connection getForTenant(String tenantId) throws SQLException {
+        if (tenantId == null || tenantId.isBlank()) {
+            return get();
+        }
+        String dbPath = resolveTenantDbPath(tenantId);
+        return getForDb(dbPath);
+    }
+
+    public static synchronized Connection getForDb(String dbPath) throws SQLException {
+        Connection conn = tenantConnections.get(dbPath);
+        if (conn == null || conn.isClosed()) {
+            conn = createRawConnection(dbPath);
+            tenantConnections.put(dbPath, conn);
+        }
+        final Connection targetConn = conn;
+        return (Connection) Proxy.newProxyInstance(
+                Connection.class.getClassLoader(),
+                new Class<?>[]{Connection.class},
+                (proxy, method, args) -> {
+                    if ("close".equals(method.getName())) {
+                        return null; // 保持租戶連線持續有效，忽略 try-with-resources 關閉
+                    }
+                    if ("isClosed".equals(method.getName())) {
+                        return targetConn == null || targetConn.isClosed();
+                    }
+                    try {
+                        return method.invoke(targetConn, args);
+                    } catch (java.lang.reflect.InvocationTargetException e) {
+                        throw e.getCause();
+                    }
+                }
+        );
+    }
+
+    public static String resolveTenantDbPath(String tenantId) {
+        String clean = tenantId.trim().replaceAll("[^a-zA-Z0-9_.-]", "_");
+        return "data/" + clean + ".db";
+    }
+
+    public static synchronized void closeTenant(String tenantId) {
+        String dbPath = resolveTenantDbPath(tenantId);
+        Connection conn = tenantConnections.remove(dbPath);
+        if (conn != null) {
+            try {
+                if (!conn.isClosed()) conn.close();
+            } catch (SQLException ignored) {}
+        }
+    }
+
+    public static synchronized void closeAllTenants() {
+        for (Connection conn : tenantConnections.values()) {
+            if (conn != null) {
+                try {
+                    if (!conn.isClosed()) conn.close();
+                } catch (SQLException ignored) {}
+            }
+        }
+        tenantConnections.clear();
+        closeCurrent();
     }
 
     public static synchronized void switchDatabase(String dbPath) throws SQLException {
@@ -81,6 +162,10 @@ public final class DbManager {
     }
 
     private static void openConnection(String dbPath) throws SQLException {
+        currentConnection = createRawConnection(dbPath);
+    }
+
+    public static Connection createRawConnection(String dbPath) throws SQLException {
         boolean isMemory = ":memory:".equalsIgnoreCase(dbPath);
         if (!isMemory) {
             Path path = Paths.get(dbPath);
@@ -95,10 +180,10 @@ public final class DbManager {
         }
 
         String url = "jdbc:sqlite:" + dbPath;
-        currentConnection = DriverManager.getConnection(url);
-
-        applyPragmas(currentConnection);
-        migrateSchema(currentConnection);
+        Connection conn = DriverManager.getConnection(url);
+        applyPragmas(conn);
+        migrateSchema(conn);
+        return conn;
     }
 
     public static void applyPragmas(Connection conn) throws SQLException {
@@ -121,21 +206,15 @@ public final class DbManager {
         if (!tablesExist) {
             // 全新資料庫，執行全套建表腳本
             initFullSchema(conn);
-            setUserVersion(conn, CURRENT_SCHEMA_VERSION);
+            setSchemaVersion(conn, CURRENT_SCHEMA_VERSION);
             getOrInitClientId(conn, currentDbPath);
             return;
         }
 
-        int version = 0;
-        try (Statement st = conn.createStatement();
-             ResultSet rs = st.executeQuery("PRAGMA user_version;")) {
-            if (rs.next()) {
-                version = rs.getInt(1);
-            }
-        }
+        int version = getSchemaVersion(conn);
 
         if (version < CURRENT_SCHEMA_VERSION) {
-            // 升級舊資料庫：包覆於交易中以保證結構遷移原子性
+            // 升級舊資料庫：包覆於交易中以保證結構遷移原子性（版本號寫入 system_meta 隨交易回滾）
             boolean originAutoCommit = conn.getAutoCommit();
             conn.setAutoCommit(false);
             try {
@@ -147,7 +226,8 @@ public final class DbManager {
                     upgradeTriggers(conn);
                     getOrInitClientId(conn, currentDbPath);
                 }
-                setUserVersion(conn, CURRENT_SCHEMA_VERSION);
+                // 寫入 system_meta（在交易內，若遷移拋出例外，版本號隨事務 100% 回滾）
+                setSchemaVersion(conn, CURRENT_SCHEMA_VERSION);
                 conn.commit();
             } catch (Exception e) {
                 conn.rollback();
@@ -156,6 +236,41 @@ public final class DbManager {
                 conn.setAutoCommit(originAutoCommit);
             }
         }
+    }
+
+    public static int getSchemaVersion(Connection conn) throws SQLException {
+        // 優先從 system_meta 查詢（支援 100% 事務回滾）
+        try {
+            ensureSystemTables(conn);
+            String sql = "SELECT meta_value FROM system_meta WHERE meta_key = 'schema_version'";
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery(sql)) {
+                if (rs.next()) {
+                    return Integer.parseInt(rs.getString(1).trim());
+                }
+            }
+        } catch (Exception ignored) {
+            // 尚未建立 system_meta 或舊版資料庫時 fallback 至 PRAGMA user_version
+        }
+
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("PRAGMA user_version;")) {
+            if (rs.next()) {
+                return rs.getInt(1);
+            }
+        }
+        return 0;
+    }
+
+    public static void setSchemaVersion(Connection conn, int v) throws SQLException {
+        ensureSystemTables(conn);
+        String sql = "INSERT INTO system_meta (meta_key, meta_value) VALUES ('schema_version', ?) " +
+                     "ON CONFLICT(meta_key) DO UPDATE SET meta_value = excluded.meta_value";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, String.valueOf(v));
+            ps.executeUpdate();
+        }
+        setUserVersion(conn, v);
     }
 
     public static void initFullSchema(Connection conn) throws SQLException {
