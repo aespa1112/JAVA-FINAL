@@ -13,6 +13,7 @@ public final class SessionContext {
     private static String currentUser;
     private static String currentUserDisplay;
     private static String currentClientPath;
+    private static final ThreadLocal<String> threadTenant = new ThreadLocal<>();
     private static volatile boolean enabled = true;
 
     /** 測試專用：明確啟用才允許無 Session 操作 */
@@ -76,10 +77,27 @@ public final class SessionContext {
         return currentClientPath;
     }
 
+    public static void setTenant(String tenantId) {
+        if (tenantId == null || tenantId.isBlank()) {
+            threadTenant.remove();
+            DbManager.clearCurrentTenant();
+            return;
+        }
+        new com.ledger.service.TenantSecurityService().assertAccess(tenantId);
+        threadTenant.set(tenantId);
+        DbManager.setCurrentTenant(tenantId);
+    }
+
+    public static String getTenant() {
+        return threadTenant.get();
+    }
+
     public static void clear() {
         currentUser = null;
         currentUserDisplay = null;
         currentClientPath = null;
+        threadTenant.remove();
+        DbManager.clearCurrentTenant();
         enabled = true;
     }
 
@@ -92,6 +110,8 @@ public final class SessionContext {
         enabled = false;
         currentUser = null;
         currentUserDisplay = null;
+        threadTenant.remove();
+        DbManager.clearCurrentTenant();
     }
 
     public static String requireUser() {
