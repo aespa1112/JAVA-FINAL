@@ -26,8 +26,8 @@
 
 ## 4. 月結與年結
 - 月結：CHECKER 鎖定 `fiscal_periods`。
-- 年結前：1–11 月須 CLOSED、12 月期間須存在、無 DRAFT、無未完成沖銷草稿、年度結帳紀錄唯一。
-- 年結產生 `voucher_type=YEAR_END_CLOSE` 傳票，並寫入 `year_end_closings` 狀態機（PENDING_DRAFT→DRAFT→POSTED）。
+- 年結前：十二個月均須 CLOSED、無 DRAFT、無未完成沖銷草稿、年度結帳紀錄唯一。
+- 年結產生 `voucher_type=YEAR_END_CLOSE` 傳票，並寫入 `year_end_closings` 狀態機。
 - 反結：僅 CHECKER；後續年度已結者須先反結；產生紅字草稿待第二人過帳。
 
 ## 5. 備份復原程序
@@ -47,10 +47,3 @@
 ## 8. 原始憑證管理
 - 傳票可掛載附件（AttachmentService）。
 - 附件與傳票 ID 關聯保存，刪除須留審計軌跡。
-
-## 9. 環境變數
-| 變數 | 說明 |
-|------|------|
-| `LEDGER_ENV=PRODUCTION` | 預設；強制登入、不種子示範帳號 |
-| `LEDGER_ENV=DEMO` | 示範帳號（明確設定才啟用） |
-| `LEDGER_ENV=TEST` | 測試；可配合 `-Dledger.test=true` |

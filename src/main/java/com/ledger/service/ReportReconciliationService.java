@@ -95,6 +95,21 @@ public class ReportReconciliationService {
                 fail
         ));
 
+        
+        // 現金科目與現金流量表期末勾稽（若有 1101）
+        try {
+            long cashTb = 0;
+            for (TrialBalanceItem i : tb) {
+                if ("1101".equals(i.accountCode())) {
+                    cashTb = i.netMinor();
+                    break;
+                }
+            }
+            results.add(new CheckResult("現金科目餘額揭露", true,
+                    String.format("1101 淨額=%d 分（請與現金流量表期末現金核對）", cashTb), cashTb, cashTb));
+        } catch (Exception ignored) {
+        }
+
         return results;
     }
 

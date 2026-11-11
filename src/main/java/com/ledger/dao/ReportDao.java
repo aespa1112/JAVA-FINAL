@@ -334,9 +334,12 @@ public class ReportDao {
                         totalEquity += net;
                         list.add(new FinancialStatementItem("權益", code, name, net));
                     } else if ("REVENUE".equalsIgnoreCase(type)) {
+                        // 收入 = 貸 - 借；SQL prior_net/curr_net = (credit - debit)
                         priorNetIncome += priorNet;
                         currentNetIncome += currNet;
                     } else if ("EXPENSE".equalsIgnoreCase(type)) {
+                        // 費用科目的 (credit - debit) 為費用淨額之相反數；
+                        // 直接累加 (credit - debit) 等價於「淨利 -= (借 - 貸)」，避免二次反轉。
                         priorNetIncome += priorNet;
                         currentNetIncome += currNet;
                     }

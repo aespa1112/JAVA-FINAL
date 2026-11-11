@@ -21,7 +21,10 @@ public class AuthService {
     public record UserAccount(String username, String displayName, OperatorRole role, boolean enabled) {}
 
     private static final String DB_PATH = "data/system_users.db";
-    private static final int PBKDF2_ITERATIONS = 120_000;
+    private static final int PBKDF2_ITERATIONS = 210_000;
+    private static final int MAX_FAILED_ATTEMPTS = 5;
+    private static final long LOCKOUT_MILLIS = 15 * 60 * 1000L;
+    private final java.util.Map<String, int[]> failedAttempts = new java.util.concurrent.ConcurrentHashMap<>(); // [count, epochSec]
     private static final int SALT_LEN = 16;
     private static final int KEY_LEN = 256;
 
@@ -57,7 +60,7 @@ public class AuthService {
             try (Statement st = conn.createStatement();
                  ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM users")) {
                 if (rs.next() && rs.getInt(1) == 0) {
-                    String env = System.getenv().getOrDefault("LEDGER_ENV", "DEMO");
+                    String env = System.getenv().getOrDefault("LEDGER_ENV", "PRODUCTION");
                     if ("PRODUCTION".equalsIgnoreCase(env)) {
                         String tmp = java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 12);
                         seed(conn, "admin", tmp, "Admin (系統管理員)", "ADMIN");
@@ -65,13 +68,23 @@ public class AuthService {
                                 "UPDATE users SET must_change_password=1 WHERE lower(username)='admin'")) {
                             ups.executeUpdate();
                         }
-                        System.err.println("[AuthService] PRODUCTION admin 初始密碼（僅顯示一次）: " + tmp);
+                        try {
+                            Path boot = Paths.get("data/.admin_bootstrap");
+                            Files.createDirectories(boot.getParent());
+                            Files.writeString(boot, tmp);
+                            boot.toFile().setReadable(true, true);
+                            boot.toFile().setWritable(true, true);
+                            System.err.println("[AuthService] PRODUCTION admin 已建立；初始密碼已寫入 data/.admin_bootstrap（請立即讀取後刪除並變更密碼）");
+                        } catch (Exception ioEx) {
+                            System.err.println("[AuthService] 無法寫入 bootstrap 檔，請以安全管道重設 admin 密碼");
+                        }
                     } else {
                         seed(conn, "admin", "admin123", "Admin (系統管理員)", "ADMIN");
                         seed(conn, "amy", "amy123", "Amy (記帳員/制單人)", "MAKER");
                         seed(conn, "bob", "bob123", "Bob (會計師/審核人)", "CHECKER");
                         seed(conn, "david", "david123", "David (會計師/審核人)", "CHECKER");
                         seed(conn, "charlie", "charlie123", "Charlie (查帳員/審計員)", "AUDITOR");
+                        System.err.println("[AuthService] DEMO 模式示範帳號已種子（請勿用於正式環境）");
                     }
                 }
             }
@@ -106,15 +119,28 @@ public class AuthService {
         if (username == null || username.isBlank()) throw new BusinessException("請輸入帳號");
         if (password == null || password.isEmpty()) throw new BusinessException("請輸入密碼");
         String key = username.trim().toLowerCase();
+        checkLockout(key);
         try (Connection conn = open()) {
             try (PreparedStatement ps = conn.prepareStatement(
                     "SELECT username, password, display_name, role, enabled FROM users WHERE lower(username) = ?")) {
                 ps.setString(1, key);
                 try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next()) throw new BusinessException("帳號或密碼錯誤");
-                    if (rs.getInt("enabled") != 1) throw new BusinessException("此帳號已停用，請聯絡管理員");
+                    if (!rs.next()) {
+                        recordFail(key);
+                        auditAuth("LOGIN_FAIL", key, "user_not_found");
+                        throw new BusinessException("帳號或密碼錯誤");
+                    }
+                    if (rs.getInt("enabled") != 1) {
+                        auditAuth("LOGIN_FAIL", key, "disabled");
+                        throw new BusinessException("此帳號已停用，請聯絡管理員");
+                    }
                     String stored = rs.getString("password");
-                    if (!verifyPassword(password, stored)) throw new BusinessException("帳號或密碼錯誤");
+                    if (!verifyPassword(password, stored)) {
+                        recordFail(key);
+                        auditAuth("LOGIN_FAIL", key, "bad_password");
+                        throw new BusinessException("帳號或密碼錯誤");
+                    }
+                    clearFail(key);
                     if (!isHashed(stored)) {
                         try (PreparedStatement ups = conn.prepareStatement(
                                 "UPDATE users SET password = ? WHERE lower(username) = ?")) {
@@ -125,6 +151,7 @@ public class AuthService {
                     }
                     String canonical = rs.getString("username");
                     OperatorRole.register(canonical, OperatorRole.valueOf(rs.getString("role")));
+                    auditAuth("LOGIN_OK", canonical, "success");
                     return canonical;
                 }
             }
@@ -150,7 +177,7 @@ public class AuthService {
     }
 
     public void changePassword(String username, String oldPass, String newPass) {
-        if (newPass == null || newPass.length() < 6) throw new BusinessException("新密碼至少 6 個字元");
+        validatePasswordStrength(newPass);
         String key = username.trim().toLowerCase();
         try (Connection conn = open()) {
             try (PreparedStatement ps = conn.prepareStatement(
@@ -220,7 +247,7 @@ public class AuthService {
     public void createUser(String username, String password, String displayName, OperatorRole role, String operator) {
         requireAdmin(operator);
         if (username == null || username.isBlank()) throw new BusinessException("帳號不可空白");
-        if (password == null || password.length() < 6) throw new BusinessException("密碼至少 6 個字元");
+        validatePasswordStrength(password);
         if (role == null || role == OperatorRole.ADMIN) {
             throw new BusinessException("不可透過此介面建立管理員");
         }
@@ -274,7 +301,7 @@ public class AuthService {
 
     public void resetPassword(String username, String newPassword, String operator) {
         requireAdmin(operator);
-        if (newPassword == null || newPassword.length() < 6) throw new BusinessException("新密碼至少 6 個字元");
+        validatePasswordStrength(newPassword);
         String user = username.trim().toLowerCase();
         try (Connection conn = open();
              PreparedStatement ps = conn.prepareStatement(
@@ -302,6 +329,51 @@ public class AuthService {
                 rs.getString("display_name"),
                 OperatorRole.valueOf(rs.getString("role")),
                 rs.getInt("enabled") == 1);
+    }
+
+
+    private void validatePasswordStrength(String password) {
+        if (password == null || password.length() < 8) {
+            throw new BusinessException("密碼至少 8 個字元");
+        }
+        boolean hasLetter = password.chars().anyMatch(Character::isLetter);
+        boolean hasDigit = password.chars().anyMatch(Character::isDigit);
+        if (!hasLetter || !hasDigit) {
+            throw new BusinessException("密碼須同時包含字母與數字");
+        }
+    }
+
+    private void checkLockout(String key) {
+        int[] st = failedAttempts.get(key);
+        if (st != null && st[0] >= MAX_FAILED_ATTEMPTS) {
+            long elapsed = System.currentTimeMillis() / 1000 - st[1];
+            if (elapsed < LOCKOUT_MILLIS / 1000) {
+                throw new BusinessException("登入失敗次數過多，請 " + ((LOCKOUT_MILLIS / 1000 - elapsed) / 60 + 1) + " 分鐘後再試");
+            }
+            failedAttempts.remove(key);
+        }
+    }
+
+    private void recordFail(String key) {
+        int[] st = failedAttempts.getOrDefault(key, new int[]{0, 0});
+        st[0] = st[0] + 1;
+        st[1] = (int) (System.currentTimeMillis() / 1000);
+        failedAttempts.put(key, st);
+    }
+
+    private void clearFail(String key) {
+        failedAttempts.remove(key);
+    }
+
+    private void auditAuth(String action, String username, String detail) {
+        try {
+            Path logDir = Paths.get("data");
+            if (!Files.exists(logDir)) Files.createDirectories(logDir);
+            String line = java.time.LocalDateTime.now() + "\t" + action + "\t" + username + "\t" + detail + System.lineSeparator();
+            Files.writeString(Paths.get("data/auth_audit.log"), line,
+                    java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+        } catch (Exception ignored) {
+        }
     }
 
     public static String hashPassword(String plain) {

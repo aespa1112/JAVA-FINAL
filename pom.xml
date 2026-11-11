@@ -63,6 +63,12 @@
                 <version>3.5.2</version>
                 <configuration>
                     <argLine>-Dfile.encoding=UTF-8</argLine>
+                    <systemPropertyVariables>
+                        <ledger.test>true</ledger.test>
+                    </systemPropertyVariables>
+                    <environmentVariables>
+                        <LEDGER_ENV>TEST</LEDGER_ENV>
+                    </environmentVariables>
                 </configuration>
             </plugin>
             <plugin>
