@@ -26,6 +26,7 @@ public class AuthService {
     private static final long LOCKOUT_MILLIS = 15 * 60 * 1000L;
     private static final int SALT_LEN = 16;
     private static final int KEY_LEN = 256;
+    private static final Object AUTH_LOCK = new Object();
 
     public AuthService() { initDb(); }
 
@@ -127,96 +128,98 @@ public class AuthService {
     }
 
     public String login(String username, String password) {
-        if (username == null || username.isBlank()) throw new BusinessException("請輸入帳號");
-        if (password == null || password.isEmpty()) throw new BusinessException("請輸入密碼");
-        String key = username.trim().toLowerCase();
-        try (Connection conn = open()) {
-            boolean ac = conn.getAutoCommit();
-            conn.setAutoCommit(false);
-            try {
-                try (PreparedStatement ps = conn.prepareStatement(
-                        "SELECT username, password, display_name, role, enabled, failed_attempts, last_failed_at, locked_until FROM users WHERE lower(username) = ?")) {
-                    ps.setString(1, key);
-                    try (ResultSet rs = ps.executeQuery()) {
-                        if (!rs.next()) {
-                            auditAuth("LOGIN_FAIL", key, "user_not_found");
-                            conn.commit();
-                            throw new BusinessException("帳號或密碼錯誤");
-                        }
-
-                        long nowSec = System.currentTimeMillis() / 1000L;
-                        long lockedUntil = rs.getLong("locked_until");
-                        if (lockedUntil > nowSec) {
-                            long remMin = (lockedUntil - nowSec) / 60 + 1;
-                            auditAuth("LOGIN_LOCKOUT", key, "locked_until_" + lockedUntil);
-                            conn.commit();
-                            throw new BusinessException("登入失敗次數過多，請 " + remMin + " 分鐘後再試");
-                        }
-
-                        if (rs.getInt("enabled") != 1) {
-                            auditAuth("LOGIN_FAIL", key, "disabled");
-                            conn.commit();
-                            throw new BusinessException("此帳號已停用，請聯絡管理員");
-                        }
-
-                        String stored = rs.getString("password");
-                        if (!verifyPassword(password, stored)) {
-                            int currentFails = rs.getInt("failed_attempts") + 1;
-                            long newLockedUntil = 0;
-                            if (currentFails >= MAX_FAILED_ATTEMPTS) {
-                                newLockedUntil = nowSec + (LOCKOUT_MILLIS / 1000L);
+        synchronized (AUTH_LOCK) {
+            if (username == null || username.isBlank()) throw new BusinessException("請輸入帳號");
+            if (password == null || password.isEmpty()) throw new BusinessException("請輸入密碼");
+            String key = username.trim().toLowerCase();
+            try (Connection conn = open()) {
+                boolean ac = conn.getAutoCommit();
+                conn.setAutoCommit(false);
+                try {
+                    try (PreparedStatement ps = conn.prepareStatement(
+                            "SELECT username, password, display_name, role, enabled, failed_attempts, last_failed_at, locked_until FROM users WHERE lower(username) = ?")) {
+                        ps.setString(1, key);
+                        try (ResultSet rs = ps.executeQuery()) {
+                            if (!rs.next()) {
+                                auditAuth("LOGIN_FAIL", key, "user_not_found");
+                                conn.commit();
+                                throw new BusinessException("帳號或密碼錯誤");
                             }
+    
+                            long nowSec = System.currentTimeMillis() / 1000L;
+                            long lockedUntil = rs.getLong("locked_until");
+                            if (lockedUntil > nowSec) {
+                                long remMin = (lockedUntil - nowSec) / 60 + 1;
+                                auditAuth("LOGIN_LOCKOUT", key, "locked_until_" + lockedUntil);
+                                conn.commit();
+                                throw new BusinessException("登入失敗次數過多，請 " + remMin + " 分鐘後再試");
+                            }
+    
+                            if (rs.getInt("enabled") != 1) {
+                                auditAuth("LOGIN_FAIL", key, "disabled");
+                                conn.commit();
+                                throw new BusinessException("此帳號已停用，請聯絡管理員");
+                            }
+    
+                            String stored = rs.getString("password");
+                            if (!verifyPassword(password, stored)) {
+                                int currentFails = rs.getInt("failed_attempts") + 1;
+                                long newLockedUntil = 0;
+                                if (currentFails >= MAX_FAILED_ATTEMPTS) {
+                                    newLockedUntil = nowSec + (LOCKOUT_MILLIS / 1000L);
+                                }
+                                try (PreparedStatement ups = conn.prepareStatement(
+                                        "UPDATE users SET failed_attempts = ?, last_failed_at = ?, locked_until = ? WHERE lower(username) = ?")) {
+                                    ups.setInt(1, currentFails);
+                                    ups.setLong(2, nowSec);
+                                    ups.setLong(3, newLockedUntil);
+                                    ups.setString(4, key);
+                                    ups.executeUpdate();
+                                }
+                                conn.commit();
+                                auditAuth("LOGIN_FAIL", key, "bad_password");
+                                if (newLockedUntil > nowSec) {
+                                    throw new BusinessException("登入失敗次數過多，請 15 分鐘後再試");
+                                }
+                                throw new BusinessException("帳號或密碼錯誤");
+                            }
+    
+                            // 登入成功：重設失敗次數與鎖定期限
                             try (PreparedStatement ups = conn.prepareStatement(
-                                    "UPDATE users SET failed_attempts = ?, last_failed_at = ?, locked_until = ? WHERE lower(username) = ?")) {
-                                ups.setInt(1, currentFails);
-                                ups.setLong(2, nowSec);
-                                ups.setLong(3, newLockedUntil);
-                                ups.setString(4, key);
+                                    "UPDATE users SET failed_attempts = 0, last_failed_at = 0, locked_until = 0 WHERE lower(username) = ?")) {
+                                ups.setString(1, key);
                                 ups.executeUpdate();
                             }
+    
+                            if (!isHashed(stored)) {
+                                try (PreparedStatement ups = conn.prepareStatement(
+                                        "UPDATE users SET password = ? WHERE lower(username) = ?")) {
+                                    ups.setString(1, hashPassword(password));
+                                    ups.setString(2, key);
+                                    ups.executeUpdate();
+                                }
+                            }
                             conn.commit();
-                            auditAuth("LOGIN_FAIL", key, "bad_password");
-                            if (newLockedUntil > nowSec) {
-                                throw new BusinessException("登入失敗次數過多，請 15 分鐘後再試");
-                            }
-                            throw new BusinessException("帳號或密碼錯誤");
+                            String canonical = rs.getString("username");
+                            OperatorRole.register(canonical, OperatorRole.valueOf(rs.getString("role")));
+                            auditAuth("LOGIN_OK", canonical, "success");
+                            return canonical;
                         }
-
-                        // 登入成功：重設失敗次數與鎖定期限
-                        try (PreparedStatement ups = conn.prepareStatement(
-                                "UPDATE users SET failed_attempts = 0, last_failed_at = 0, locked_until = 0 WHERE lower(username) = ?")) {
-                            ups.setString(1, key);
-                            ups.executeUpdate();
-                        }
-
-                        if (!isHashed(stored)) {
-                            try (PreparedStatement ups = conn.prepareStatement(
-                                    "UPDATE users SET password = ? WHERE lower(username) = ?")) {
-                                ups.setString(1, hashPassword(password));
-                                ups.setString(2, key);
-                                ups.executeUpdate();
-                            }
-                        }
-                        conn.commit();
-                        String canonical = rs.getString("username");
-                        OperatorRole.register(canonical, OperatorRole.valueOf(rs.getString("role")));
-                        auditAuth("LOGIN_OK", canonical, "success");
-                        return canonical;
                     }
+                } catch (SQLException e) {
+                    conn.rollback();
+                    throw e;
+                } finally {
+                    conn.setAutoCommit(ac);
                 }
-            } catch (SQLException e) {
-                conn.rollback();
+            } catch (BusinessException e) {
                 throw e;
-            } finally {
-                conn.setAutoCommit(ac);
+            } catch (SQLException e) {
+                throw new BusinessException("登入失敗: " + e.getMessage(), e);
             }
-        } catch (BusinessException e) {
-            throw e;
-        } catch (SQLException e) {
-            throw new BusinessException("登入失敗: " + e.getMessage(), e);
         }
-    }
-
+    
+        }
     public boolean mustChangePassword(String username) {
         if (username == null) return false;
         try (Connection conn = open();
@@ -355,22 +358,24 @@ public class AuthService {
     }
 
     public void resetPassword(String username, String newPassword, String operator) {
-        requireAdmin(operator);
-        validatePasswordStrength(newPassword);
-        String user = username.trim().toLowerCase();
-        try (Connection conn = open();
-             PreparedStatement ps = conn.prepareStatement(
-                     "UPDATE users SET password = ?, must_change_password=1, failed_attempts=0, last_failed_at=0, locked_until=0 WHERE lower(username) = ?")) {
-            ps.setString(1, hashPassword(newPassword));
-            ps.setString(2, user);
-            if (ps.executeUpdate() == 0) throw new BusinessException("找不到帳號: " + user);
-        } catch (BusinessException e) {
-            throw e;
-        } catch (SQLException e) {
-            throw new BusinessException("重設密碼失敗: " + e.getMessage(), e);
+        synchronized (AUTH_LOCK) {
+            requireAdmin(operator);
+            validatePasswordStrength(newPassword);
+            String user = username.trim().toLowerCase();
+            try (Connection conn = open();
+                 PreparedStatement ps = conn.prepareStatement(
+                         "UPDATE users SET password = ?, must_change_password=1, failed_attempts=0, last_failed_at=0, locked_until=0 WHERE lower(username) = ?")) {
+                ps.setString(1, hashPassword(newPassword));
+                ps.setString(2, user);
+                if (ps.executeUpdate() == 0) throw new BusinessException("找不到帳號: " + user);
+            } catch (BusinessException e) {
+                throw e;
+            } catch (SQLException e) {
+                throw new BusinessException("重設密碼失敗: " + e.getMessage(), e);
+            }
         }
-    }
-
+    
+        }
     private void requireAdmin(String operator) {
         UserAccount acc = getAccount(operator);
         if (acc == null || acc.role() != OperatorRole.ADMIN) {

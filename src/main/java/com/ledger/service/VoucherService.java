@@ -84,82 +84,11 @@ public class VoucherService {
     }
 
     public Voucher createDraft(String voucherDate, String summary, Long reversedId, String preparer, List<VoucherEntry> entries) {
-        String normPreparer = SessionContext.resolveOperator(preparer);
-        OperatorRole role = OperatorRole.resolve(normPreparer);
-        if (role == OperatorRole.AUDITOR) {
-            throw new BusinessException("權限不足：查帳員（" + normPreparer + "）為唯讀身分，無權建立傳票");
-        }
-        if (reversedId == null && role == OperatorRole.CHECKER) {
-            throw new BusinessException("職責分離原則：會計師（審核人 " + normPreparer + "）不得兼任制單人建立一般傳票");
-        }
-
-        return createDraftInternal(voucherDate, summary, reversedId, normPreparer, entries, null, null);
-    }
-
-    /**
-     * 內部建立草稿。
-     * @param reverseInitiator 若為紅字沖銷，傳入發起人標準名稱，會在同一交易中寫入 REVERSE_INITIATED 日誌。
-     * @param originVoucherNo  原傳票編號（僅用於審計日誌說明）。
-     */
-    private Voucher createDraftInternal(String voucherDate, String summary, Long reversedId,
-                                        String preparer, List<VoucherEntry> entries,
-                                        String reverseInitiator, String originVoucherNo) {
-        if (preparer == null || preparer.trim().isEmpty()) {
-            throw new BusinessException("制單人不可為空");
-        }
-        if (summary == null || summary.trim().isEmpty()) {
-            throw new BusinessException("傳票摘要不可為空");
-        }
-        if (voucherDate == null || voucherDate.trim().isEmpty()) {
-            throw new BusinessException("傳票日期不可為空");
-        }
-
-        validateBalance(entries);
-
-        LocalDate date = LocalDate.parse(voucherDate.trim());
-        int year = date.getYear();
-        int month = date.getMonthValue();
-
         try (Connection conn = DbManager.get()) {
             boolean originAutoCommit = conn.getAutoCommit();
             conn.setAutoCommit(false);
             try {
-                FiscalPeriod period = periodDao.getOrCreate(conn, year, month);
-                if (period.isClosed()) {
-                    throw new BusinessException("該會計期間 (" + period.getPeriodName() + ") 已結帳鎖定，不得新增憑證");
-                }
-
-                validateAccountsUsable(conn, entries);
-
-                String voucherNo = voucherDao.generateNextVoucherNo(conn, period.id(), year, month);
-                Voucher draft = new Voucher(
-                        null,
-                        period.id(),
-                        voucherNo,
-                        voucherDate.trim(),
-                        summary.trim(),
-                        "DRAFT",
-                        preparer.trim(),
-                        null,
-                        reversedId,
-                        null,
-                        null,
-                        entries
-                );
-
-                Voucher created = voucherDao.create(conn, draft, entries);
-                auditDao.log(conn, "CREATE_DRAFT", "vouchers", created.id(), preparer, null, "VoucherNo: " + voucherNo);
-
-                // 紅字沖銷：在同一交易中寫入發起紀錄，確保草稿與審計日誌原子性
-                if (reversedId != null && reverseInitiator != null && !reverseInitiator.isBlank()) {
-                    String detail = "Created Draft: " + voucherNo;
-                    if (originVoucherNo != null && !originVoucherNo.isBlank()) {
-                        detail = "Origin: " + originVoucherNo + " | " + detail;
-                    }
-                    auditDao.log(conn, "REVERSE_INITIATED", "vouchers", created.id(),
-                            reverseInitiator, originVoucherNo, detail);
-                }
-
+                Voucher created = createDraft(conn, voucherDate, summary, reversedId, preparer, entries);
                 conn.commit();
                 return created;
             } catch (Exception e) {
@@ -177,75 +106,104 @@ public class VoucherService {
         }
     }
 
+    public Voucher createDraft(Connection conn, String voucherDate, String summary, String preparer, List<VoucherEntry> entries) {
+        return createDraft(conn, voucherDate, summary, null, preparer, entries);
+    }
+
+    public Voucher createDraft(Connection conn, String voucherDate, String summary, Long reversedId, String preparer, List<VoucherEntry> entries) {
+        String normPreparer = SessionContext.resolveOperator(preparer);
+        OperatorRole role = OperatorRole.resolve(normPreparer);
+        if (role == OperatorRole.AUDITOR) {
+            throw new BusinessException("權限不足：查帳員（" + normPreparer + "）為唯讀身分，無權建立傳票");
+        }
+        if (reversedId == null && role == OperatorRole.CHECKER) {
+            throw new BusinessException("職責分離原則：會計師（審核人 " + normPreparer + "）不得兼任制單人建立一般傳票");
+        }
+
+        try {
+            return createDraftInternal(conn, voucherDate, summary, reversedId, normPreparer, entries, null, null);
+        } catch (SQLException e) {
+            throw new BusinessException("建立傳票草稿資料庫異常: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * 內部建立草稿（支援共用 Connection 交易）。
+     * @param reverseInitiator 若為紅字沖銷，傳入發起人標準名稱，會在同一交易中寫入 REVERSE_INITIATED 日誌。
+     * @param originVoucherNo  原傳票編號（僅用於審計日誌說明）。
+     */
+    private Voucher createDraftInternal(Connection conn, String voucherDate, String summary, Long reversedId,
+                                        String preparer, List<VoucherEntry> entries,
+                                        String reverseInitiator, String originVoucherNo) throws SQLException {
+        if (preparer == null || preparer.trim().isEmpty()) {
+            throw new BusinessException("制單人不可為空");
+        }
+        if (summary == null || summary.trim().isEmpty()) {
+            throw new BusinessException("傳票摘要不可為空");
+        }
+        if (voucherDate == null || voucherDate.trim().isEmpty()) {
+            throw new BusinessException("傳票日期不可為空");
+        }
+
+        validateBalance(entries);
+
+        LocalDate date = LocalDate.parse(voucherDate.trim());
+        int year = date.getYear();
+        int month = date.getMonthValue();
+
+        FiscalPeriod period = periodDao.getOrCreate(conn, year, month);
+        if (period.isClosed()) {
+            throw new BusinessException("該會計期間 (" + period.getPeriodName() + ") 已結帳鎖定，不得新增憑證");
+        }
+
+        validateAccountsUsable(conn, entries);
+
+        String voucherNo = voucherDao.generateNextVoucherNo(conn, period.id(), year, month);
+        Voucher draft = new Voucher(
+                null,
+                period.id(),
+                voucherNo,
+                voucherDate.trim(),
+                summary.trim(),
+                "DRAFT",
+                preparer.trim(),
+                null,
+                reversedId,
+                null,
+                null,
+                entries
+        );
+
+        Voucher created = voucherDao.create(conn, draft, entries);
+        auditDao.log(conn, "CREATE_DRAFT", "vouchers", created.id(), preparer, null, "VoucherNo: " + voucherNo);
+
+        // 紅字沖銷：在同一交易中寫入發起紀錄，確保草稿與審計日誌原子性
+        if (reversedId != null && reverseInitiator != null && !reverseInitiator.isBlank()) {
+            String detail = "Created Draft: " + voucherNo;
+            if (originVoucherNo != null && !originVoucherNo.isBlank()) {
+                detail = "Origin: " + originVoucherNo + " | " + detail;
+            }
+            auditDao.log(conn, "REVERSE_INITIATED", "vouchers", created.id(),
+                    reverseInitiator, originVoucherNo, detail);
+        }
+
+        return created;
+    }
+
     public void post(long voucherId, String reviewer) {
         if (reviewer == null || reviewer.trim().isEmpty()) {
             throw new BusinessException("審核人不可為空");
-        }
-
-        String normReviewer = SessionContext.resolveOperator(reviewer);
-        OperatorRole role = OperatorRole.resolve(normReviewer);
-        if (role != OperatorRole.CHECKER) {
-            throw new BusinessException("權限不足：僅會計師（審核人）有權審核過帳傳票，當前身分無此權限！");
         }
 
         try (Connection conn = DbManager.get()) {
             boolean originAutoCommit = conn.getAutoCommit();
             conn.setAutoCommit(false);
             try {
-                Voucher voucher = voucherDao.findById(conn, voucherId)
-                        .orElseThrow(() -> new BusinessException("傳票不存在: ID " + voucherId));
-
-                if (!voucher.isDraft()) {
-                    throw new BusinessException("僅草稿狀態憑證可進行過帳，目前狀態: " + voucher.status());
-                }
-
-                if (voucher.preparer().equalsIgnoreCase(normReviewer)) {
-                    throw new BusinessException(
-                            String.format("職責分離原則：制單人與審核人不得為同一人（制單人：%s，審核人：%s）",
-                                    voucher.preparer(), normReviewer));
-                }
-
-                // 針對紅字沖銷傳票執行雙人審核控制（Fail-Closed）
-                if (voucher.reversedId() != null) {
-                    String checkInitiatorSql =
-                            "SELECT operator FROM audit_log " +
-                            "WHERE action = 'REVERSE_INITIATED' AND (record_id = ? OR record_id = ?) " +
-                            "ORDER BY id DESC LIMIT 1";
-                    String initiator = null;
-                    try (PreparedStatement ps = conn.prepareStatement(checkInitiatorSql)) {
-                        ps.setLong(1, voucherId);
-                        ps.setLong(2, voucher.reversedId());
-                        try (ResultSet rs = ps.executeQuery()) {
-                            if (rs.next()) {
-                                initiator = rs.getString(1);
-                            }
-                        }
-                    }
-
-                    // Fail-Closed：缺少發起紀錄時拒絕過帳，防止雙人審核被繞過
-                    if (initiator == null || initiator.isBlank()) {
-                        throw new BusinessException(
-                                "紅字沖銷傳票缺少 REVERSE_INITIATED 發起紀錄，無法過帳。請重新發起沖銷以確保雙人審核可追蹤！");
-                    }
-
-                    if (initiator.equalsIgnoreCase(normReviewer)) {
-                        throw new BusinessException(
-                                String.format("職責分離原則：紅字沖銷發起人（%s）不得自行審核過帳該沖銷傳票，必須由第二位會計師審核！",
-                                        initiator));
-                    }
-                }
-
-                validateBalance(voucher.entries());
-                validateAccountsUsable(conn, voucher.entries());
-
-                voucherDao.lockAndCheckDraft(conn, voucherId);
-                voucherDao.markPosted(conn, voucherId, normReviewer);
-                auditDao.log(conn, "POST", "vouchers", voucherId, normReviewer, "DRAFT", "POSTED");
-
+                post(conn, voucherId, reviewer);
                 conn.commit();
             } catch (Exception e) {
                 conn.rollback();
-                logDeniedAttempt(conn, "POST", voucherId, normReviewer, e.getMessage());
+                logDeniedAttempt(conn, "POST", voucherId, reviewer, e.getMessage());
                 if (e instanceof BusinessException be) {
                     throw be;
                 }
@@ -258,11 +216,103 @@ public class VoucherService {
         }
     }
 
+    public void post(Connection conn, long voucherId, String reviewer) {
+        if (reviewer == null || reviewer.trim().isEmpty()) {
+            throw new BusinessException("審核人不可為空");
+        }
+
+        String normReviewer = SessionContext.resolveOperator(reviewer);
+        OperatorRole role = OperatorRole.resolve(normReviewer);
+        if (role != OperatorRole.CHECKER) {
+            throw new BusinessException("權限不足：僅會計師（審核人）有權審核過帳傳票，當前身分無此權限！");
+        }
+
+        try {
+            Voucher voucher = voucherDao.findById(conn, voucherId)
+                    .orElseThrow(() -> new BusinessException("傳票不存在: ID " + voucherId));
+
+            if (!voucher.isDraft()) {
+                throw new BusinessException("僅草稿狀態憑證可進行過帳，目前狀態: " + voucher.status());
+            }
+
+            if (voucher.preparer().equalsIgnoreCase(normReviewer)) {
+                throw new BusinessException(
+                        String.format("職責分離原則：制單人與審核人不得為同一人（制單人：%s，審核人：%s）",
+                                voucher.preparer(), normReviewer));
+            }
+
+            // 針對紅字沖銷傳票執行雙人審核控制（Fail-Closed）
+            if (voucher.reversedId() != null) {
+                String checkInitiatorSql =
+                        "SELECT operator FROM audit_log " +
+                        "WHERE action = 'REVERSE_INITIATED' AND (record_id = ? OR record_id = ?) " +
+                        "ORDER BY id DESC LIMIT 1";
+                String initiator = null;
+                try (PreparedStatement ps = conn.prepareStatement(checkInitiatorSql)) {
+                    ps.setLong(1, voucherId);
+                    ps.setLong(2, voucher.reversedId());
+                    try (ResultSet rs = ps.executeQuery()) {
+                        if (rs.next()) {
+                            initiator = rs.getString(1);
+                        }
+                    }
+                }
+
+                // Fail-Closed：缺少發起紀錄時拒絕過帳，防止雙人審核被繞過
+                if (initiator == null || initiator.isBlank()) {
+                    throw new BusinessException(
+                            "紅字沖銷傳票缺少 REVERSE_INITIATED 發起紀錄，無法過帳。請重新發起沖銷以確保雙人審核可追蹤！");
+                }
+
+                if (initiator.equalsIgnoreCase(normReviewer)) {
+                    throw new BusinessException(
+                            String.format("職責分離原則：紅字沖銷發起人（%s）不得自行審核過帳該沖銷傳票，必須由第二位會計師審核！",
+                                    initiator));
+                }
+            }
+
+            validateBalance(voucher.entries());
+            validateAccountsUsable(conn, voucher.entries());
+
+            voucherDao.lockAndCheckDraft(conn, voucherId);
+            voucherDao.markPosted(conn, voucherId, normReviewer);
+            auditDao.log(conn, "POST", "vouchers", voucherId, normReviewer, "DRAFT", "POSTED");
+        } catch (SQLException e) {
+            throw new BusinessException("資料庫操作異常: " + e.getMessage(), e);
+        }
+    }
+
     public Voucher reverse(long originId, String reason, String operator) {
         return reverse(originId, null, reason, operator);
     }
 
     public Voucher reverse(long originId, String targetDate, String reason, String operator) {
+        try (Connection conn = DbManager.get()) {
+            boolean originAutoCommit = conn.getAutoCommit();
+            conn.setAutoCommit(false);
+            try {
+                Voucher rev = reverse(conn, originId, targetDate, reason, operator);
+                conn.commit();
+                return rev;
+            } catch (Exception e) {
+                conn.rollback();
+                if (e instanceof BusinessException be) {
+                    throw be;
+                }
+                throw new BusinessException("沖銷失敗: " + e.getMessage(), e);
+            } finally {
+                conn.setAutoCommit(originAutoCommit);
+            }
+        } catch (SQLException e) {
+            throw new BusinessException("資料庫連線失敗: " + e.getMessage(), e);
+        }
+    }
+
+    public Voucher reverse(Connection conn, long originId, String reason, String operator) {
+        return reverse(conn, originId, null, reason, operator);
+    }
+
+    public Voucher reverse(Connection conn, long originId, String targetDate, String reason, String operator) {
         if (operator == null || operator.trim().isEmpty()) {
             throw new BusinessException("沖銷操作人不可為空");
         }
@@ -279,7 +329,7 @@ public class VoucherService {
             throw new BusinessException("權限不足：紅字沖銷屬於重大更正分錄，需由會計師（Bob）發起！");
         }
 
-        try (Connection conn = DbManager.get()) {
+        try {
             Voucher origin = voucherDao.findById(conn, originId)
                     .orElseThrow(() -> new BusinessException("找不到指定原憑證 ID: " + originId));
 
@@ -321,7 +371,7 @@ public class VoucherService {
                     : "Amy";
 
             // 在同一交易中建立草稿並寫入 REVERSE_INITIATED，確保原子性
-            return createDraftInternal(draftDate, summary, originId, preparer, reversedEntries,
+            return createDraftInternal(conn, draftDate, summary, originId, preparer, reversedEntries,
                     normOp, origin.voucherNo());
         } catch (SQLException e) {
             throw new BusinessException("沖銷操作異常: " + e.getMessage(), e);

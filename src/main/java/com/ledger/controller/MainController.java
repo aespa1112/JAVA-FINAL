@@ -1122,7 +1122,7 @@ public class MainController {
                 boolean hasReopenDraft = false;
                 try (var conn = com.ledger.config.DbManager.get()) {
                     yearEndClosingService.ensureTable(conn);
-                    try (var ps = conn.prepareStatement("SELECT status FROM year_end_closings WHERE fiscal_year=?")) {
+                    try (var ps = conn.prepareStatement("SELECT status FROM year_end_closings WHERE fiscal_year=? ORDER BY closing_sequence DESC, id DESC LIMIT 1")) {
                         ps.setInt(1, year);
                         try (var rs = ps.executeQuery()) {
                             if (rs.next() && "REOPEN_DRAFT".equals(rs.getString("status"))) {
@@ -1207,13 +1207,27 @@ public class MainController {
             var svc = new ReportReconciliationService();
             var results = svc.reconcile(start, end);
             StringBuilder sb = new StringBuilder();
-            boolean all = true;
+            boolean allPassed = true;
+            boolean hasFailed = false;
+            boolean hasNotChecked = false;
             for (var r : results) {
-                sb.append(r.passed() ? "✓ " : "✗ ").append(r.name()).append(" — ").append(r.detail()).append("\n");
-                if (!r.passed()) all = false;
+                String tag;
+                if (r.status() == ReportReconciliationService.CheckStatus.PASSED) {
+                    tag = "【通過】";
+                } else if (r.status() == ReportReconciliationService.CheckStatus.FAILED) {
+                    tag = "【失敗】";
+                    hasFailed = true;
+                    allPassed = false;
+                } else {
+                    tag = "【未檢查】";
+                    hasNotChecked = true;
+                    allPassed = false;
+                }
+                sb.append(tag).append(" ").append(r.name()).append(" — ").append(r.detail()).append("\n");
             }
-            if (all) showInfo("報表勾稽", "全部通過\n\n" + sb);
-            else showWarn("報表勾稽", "存在差異\n\n" + sb);
+            if (allPassed) showInfo("報表勾稽", "全部通過\n\n" + sb);
+            else if (hasFailed) showWarn("報表勾稽", "存在勾稽失敗項目\n\n" + sb);
+            else showWarn("報表勾稽", "存在未檢查項目，未全部通過\n\n" + sb);
         } catch (Exception e) {
             showError("勾稽失敗", e.getMessage());
         }

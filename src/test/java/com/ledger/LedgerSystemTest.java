@@ -30,6 +30,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.sql.DriverManager;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -1382,5 +1383,455 @@ public class LedgerSystemTest {
 
         // 3. 驗證資產負債表公式：資產 = 負債 + 權益
         assertEquals(totalAssets, totalLiabilities + totalEquity, "資產負債表必須嚴格符合 資產 = 負債 + 權益");
+    }
+
+    // =========================================================================
+    //  R6: 第六輪新增測試（年結原子性、反結恢復、歷史保留、12月復原、NOT_CHECKED、並行登入）
+    // =========================================================================
+
+    @Test
+    @DisplayName("R6-P1-03-01: 年結傳票建立後，狀態更新失敗（交易原子性 rollback）")
+    void testR6_YearEndDraftFailureRollback() throws SQLException {
+        int year = 2061;
+        voucherService.post(
+                voucherService.createDraft(year + "-01-15", "測試收入", "Amy", List.of(
+                        entry("1101", "1000.00", "0"),
+                        entry("4101", "0", "1000.00")
+                )).id(), "Bob");
+        setupFullYearPeriods(year);
+        closingService.closePeriod(year, 12, "Bob");
+
+        YearEndClosingService ye = new YearEndClosingService();
+        YearEndClosingService.simulateFailureAfterYearEndDraftCreate = true;
+        try {
+            assertThrows(Exception.class, () -> ye.createYearEndDraft(year, "Amy"));
+        } finally {
+            YearEndClosingService.simulateFailureAfterYearEndDraftCreate = false;
+        }
+
+        // 驗證 rollback：year_end_closings 無紀錄，無草稿殘留，12月仍維持 CLOSED
+        try (Connection conn = DbManager.get()) {
+            try (PreparedStatement ps = conn.prepareStatement("SELECT COUNT(*) FROM year_end_closings WHERE fiscal_year=?")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals(0, rs.getInt(1), "年結草稿建立失敗時必須 rollback，不得殘留 year_end_closings 紀錄");
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement("SELECT COUNT(*) FROM vouchers WHERE status='DRAFT' AND voucher_date LIKE ?")) {
+                ps.setString(1, year + "%");
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals(0, rs.getInt(1), "年結草稿建立失敗時傳票必須 rollback，不得殘留草稿傳票");
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement("SELECT status FROM fiscal_periods WHERE year=? AND month=12")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals("CLOSED", rs.getString("status"), "失敗後 12 月期間應維持 CLOSED 狀態");
+                }
+            }
+        }
+
+        // 驗證重試可成功建立
+        long draftId = ye.createYearEndDraft(year, "Amy");
+        assertTrue(draftId > 0, "故障排除後應可正常建立年結草稿");
+    }
+
+    @Test
+    @DisplayName("R6-P1-03-02: 年結傳票過帳後，年度狀態更新失敗（交易 rollback 且重試可恢復）")
+    void testR6_YearEndVoucherPostStatusUpdateFailsRollback() throws SQLException {
+        int year = 2062;
+        voucherService.post(
+                voucherService.createDraft(year + "-01-15", "測試收入", "Amy", List.of(
+                        entry("1101", "2000.00", "0"),
+                        entry("4101", "0", "2000.00")
+                )).id(), "Bob");
+        setupFullYearPeriods(year);
+        closingService.closePeriod(year, 12, "Bob");
+
+        YearEndClosingService ye = new YearEndClosingService();
+        long draftId = ye.createYearEndDraft(year, "Amy");
+
+        YearEndClosingService.simulateFailureAfterYearEndVoucherPost = true;
+        try {
+            assertThrows(Exception.class, () -> ye.reviewAndPostYearEnd(year, "Bob"));
+        } finally {
+            YearEndClosingService.simulateFailureAfterYearEndVoucherPost = false;
+        }
+
+        // 驗證 rollback：傳票仍為 DRAFT，年度狀態仍為 DRAFT
+        try (Connection conn = DbManager.get()) {
+            Voucher v = voucherDao.findById(conn, draftId).orElseThrow();
+            assertEquals("DRAFT", v.status(), "交易 rollback 後傳票應保持 DRAFT 狀態");
+
+            try (PreparedStatement ps = conn.prepareStatement("SELECT status FROM year_end_closings WHERE fiscal_year=?")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals("DRAFT", rs.getString("status"), "交易 rollback 後年度狀態應保持 DRAFT");
+                }
+            }
+        }
+
+        // 重試過帳應順利成功
+        long postedId = ye.reviewAndPostYearEnd(year, "Bob");
+        assertEquals(draftId, postedId);
+        Voucher postedVoucher = voucherDao.findById(postedId).orElseThrow();
+        assertEquals("POSTED", postedVoucher.status());
+    }
+
+    @Test
+    @DisplayName("R6-P1-03-03: 年結成功後，期間鎖定失敗（交易 rollback）")
+    void testR6_YearEndPeriodLockFailureRollback() throws SQLException {
+        int year = 2063;
+        voucherService.post(
+                voucherService.createDraft(year + "-01-15", "測試收入", "Amy", List.of(
+                        entry("1101", "3000.00", "0"),
+                        entry("4101", "0", "3000.00")
+                )).id(), "Bob");
+        setupFullYearPeriods(year);
+        closingService.closePeriod(year, 12, "Bob");
+
+        YearEndClosingService ye = new YearEndClosingService();
+        long draftId = ye.createYearEndDraft(year, "Amy");
+
+        YearEndClosingService.simulateFailureAfterYearEndPeriodLock = true;
+        try {
+            assertThrows(Exception.class, () -> ye.reviewAndPostYearEnd(year, "Bob"));
+        } finally {
+            YearEndClosingService.simulateFailureAfterYearEndPeriodLock = false;
+        }
+
+        // 驗證 rollback
+        try (Connection conn = DbManager.get()) {
+            try (PreparedStatement ps = conn.prepareStatement("SELECT status FROM year_end_closings WHERE fiscal_year=?")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals("DRAFT", rs.getString("status"), "期間鎖定失敗時整體交易應 rollback，狀態仍為 DRAFT");
+                }
+            }
+        }
+
+        // 重試成功並確認 12 個月皆為 CLOSED
+        ye.reviewAndPostYearEnd(year, "Bob");
+        try (Connection conn = DbManager.get();
+             PreparedStatement ps = conn.prepareStatement("SELECT COUNT(*) FROM fiscal_periods WHERE year=? AND status='CLOSED'")) {
+            ps.setInt(1, year);
+            try (ResultSet rs = ps.executeQuery()) {
+                assertTrue(rs.next());
+                assertEquals(12, rs.getInt(1));
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("R6-P1-03-04: 反結傳票建立後，狀態更新失敗（交易 rollback）")
+    void testR6_ReopenDraftCreateStatusUpdateFailsRollback() throws SQLException {
+        int year = 2064;
+        voucherService.post(
+                voucherService.createDraft(year + "-01-15", "測試收入", "Amy", List.of(
+                        entry("1101", "1200.00", "0"),
+                        entry("4101", "0", "1200.00")
+                )).id(), "Bob");
+        setupFullYearPeriods(year);
+
+        YearEndClosingService ye = new YearEndClosingService();
+        ye.closeYear(year, "Amy", "Bob");
+
+        YearEndClosingService.simulateFailureAfterReopenDraftCreate = true;
+        try {
+            assertThrows(Exception.class, () -> ye.initiateReopenYear(year, "Bob", "原因"));
+        } finally {
+            YearEndClosingService.simulateFailureAfterReopenDraftCreate = false;
+        }
+
+        // 驗證 rollback：年度仍為 POSTED，無反結草稿
+        try (Connection conn = DbManager.get()) {
+            try (PreparedStatement ps = conn.prepareStatement("SELECT status, reverse_voucher_id FROM year_end_closings WHERE fiscal_year=?")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals("POSTED", rs.getString("status"), "反結草稿失敗應 rollback，維持 POSTED 狀態");
+                    assertNull(rs.getString("reverse_voucher_id"));
+                }
+            }
+        }
+
+        // 重試可成功建立反結草稿
+        long revId = ye.initiateReopenYear(year, "Bob", "原因");
+        assertTrue(revId > 0);
+    }
+
+    @Test
+    @DisplayName("R6-P1-03-05: 反結傳票過帳後，年度狀態更新失敗（交易 rollback）")
+    void testR6_ReopenPostStatusUpdateFailsRollback() throws SQLException {
+        int year = 2065;
+        voucherService.post(
+                voucherService.createDraft(year + "-01-15", "測試收入", "Amy", List.of(
+                        entry("1101", "1500.00", "0"),
+                        entry("4101", "0", "1500.00")
+                )).id(), "Bob");
+        setupFullYearPeriods(year);
+
+        YearEndClosingService ye = new YearEndClosingService();
+        ye.closeYear(year, "Amy", "Bob");
+        long revDraftId = ye.initiateReopenYear(year, "Bob", "反結測試");
+
+        YearEndClosingService.simulateFailureAfterReopenVoucherPost = true;
+        try {
+            assertThrows(Exception.class, () -> ye.confirmReopenYear(year, "David"));
+        } finally {
+            YearEndClosingService.simulateFailureAfterReopenVoucherPost = false;
+        }
+
+        // 驗證 rollback：年度狀態仍為 REOPEN_DRAFT，沖銷傳票仍為 DRAFT，期間仍為 CLOSED
+        try (Connection conn = DbManager.get()) {
+            try (PreparedStatement ps = conn.prepareStatement("SELECT status FROM year_end_closings WHERE fiscal_year=?")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals("REOPEN_DRAFT", rs.getString("status"));
+                }
+            }
+            Voucher rv = voucherDao.findById(conn, revDraftId).orElseThrow();
+            assertEquals("DRAFT", rv.status());
+            try (PreparedStatement ps = conn.prepareStatement("SELECT COUNT(*) FROM fiscal_periods WHERE year=? AND status='CLOSED'")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals(12, rs.getInt(1));
+                }
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("R6-P1-03-06: 反結傳票已過帳但狀態未同步時，重試可恢復")
+    void testR6_ReopenVoucherAlreadyPostedCanRecoverOnRetry() throws SQLException {
+        int year = 2066;
+        voucherService.post(
+                voucherService.createDraft(year + "-01-15", "測試收入", "Amy", List.of(
+                        entry("1101", "2500.00", "0"),
+                        entry("4101", "0", "2500.00")
+                )).id(), "Bob");
+        setupFullYearPeriods(year);
+
+        YearEndClosingService ye = new YearEndClosingService();
+        ye.closeYear(year, "Amy", "Bob");
+        long revDraftId = ye.initiateReopenYear(year, "Bob", "補分錄");
+
+        // 模擬異常：沖銷傳票已過帳，但年度狀態仍為 REOPEN_DRAFT，期間仍為 CLOSED
+        voucherService.post(revDraftId, "David");
+
+        // 此時呼叫 confirmReopenYear 進行重試恢復
+        long recoveredId = ye.confirmReopenYear(year, "David");
+        assertEquals(revDraftId, recoveredId, "重試應成功返回已過帳之沖銷傳票 ID");
+
+        // 驗證狀態已安全補完
+        try (Connection conn = DbManager.get()) {
+            try (PreparedStatement ps = conn.prepareStatement("SELECT status FROM year_end_closings WHERE fiscal_year=?")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals("REVERSED", rs.getString("status"), "狀態應安全更新為 REVERSED");
+                }
+            }
+            try (PreparedStatement ps = conn.prepareStatement("SELECT COUNT(*) FROM fiscal_periods WHERE year=? AND status='OPEN'")) {
+                ps.setInt(1, year);
+                try (ResultSet rs = ps.executeQuery()) {
+                    assertTrue(rs.next());
+                    assertEquals(12, rs.getInt(1), "反結完成後所有期間應解鎖為 OPEN");
+                }
+            }
+        }
+        assertTrue(ye.checkConsistency().isEmpty(), "狀態補完後系統資料庫應完全一致");
+    }
+
+    @Test
+    @DisplayName("R6-P1-03-07: 12 月解鎖後模擬程序中斷，重新啟動可復原")
+    void testR6_Month12CrashRecoveryOnStartup() throws SQLException {
+        int year = 2067;
+        voucherService.post(
+                voucherService.createDraft(year + "-01-15", "測試收入", "Amy", List.of(
+                        entry("1101", "1000.00", "0"),
+                        entry("4101", "0", "1000.00")
+                )).id(), "Bob");
+        setupFullYearPeriods(year);
+        closingService.closePeriod(year, 12, "Bob");
+
+        // 模擬異常崩潰中斷：12月在結帳草稿中途被解鎖為 OPEN，且程序意外終止無 POSTED 年結
+        try (Connection conn = DbManager.get();
+             PreparedStatement ps = conn.prepareStatement("UPDATE fiscal_periods SET status='OPEN' WHERE year=? AND month=12")) {
+            ps.setInt(1, year);
+            ps.executeUpdate();
+        }
+
+        // 重新啟動（建立新實例，建構子會自動執行 checkAndRecoverOnStartup 啟動檢查並復原）
+        YearEndClosingService ye = new YearEndClosingService();
+
+        // 驗證 12 月已恢復為 CLOSED
+        try (Connection conn = DbManager.get();
+             PreparedStatement ps = conn.prepareStatement("SELECT status FROM fiscal_periods WHERE year=? AND month=12")) {
+            ps.setInt(1, year);
+            try (ResultSet rs = ps.executeQuery()) {
+                assertTrue(rs.next());
+                assertEquals("CLOSED", rs.getString("status"), "未完成年結時啟動應將 12 月恢復原期間狀態 (CLOSED)");
+            }
+        }
+
+        // 重新結帳應能正常完成
+        List<Long> ids = ye.closeYear(year, "Amy", "Bob");
+        assertFalse(ids.isEmpty(), "復原後應可正常執行年結");
+    }
+
+    @Test
+    @DisplayName("R6-P1-03-08: 同年度結帳、反結、重新結帳後完整保留歷史")
+    void testR6_HistoryPreservedAcrossMultipleClosings() throws SQLException {
+        int year = 2068;
+        voucherService.post(
+                voucherService.createDraft(year + "-01-15", "測試收入", "Amy", List.of(
+                        entry("1101", "1000.00", "0"),
+                        entry("4101", "0", "1000.00")
+                )).id(), "Bob");
+        setupFullYearPeriods(year);
+
+        YearEndClosingService ye = new YearEndClosingService();
+
+        // 第一次結帳
+        List<Long> close1 = ye.closeYear(year, "Amy", "Bob");
+        long voucher1 = close1.get(0);
+
+        // 第一次反結
+        long rev1 = ye.reopenYear(year, "Bob", "David", "補記費用");
+
+        // 在反結後補記一筆傳票
+        voucherService.post(
+                voucherService.createDraft(year + "-06-20", "補記費用傳票", "Amy", List.of(
+                        entry("5101", "200.00", "0"),
+                        entry("1101", "0", "200.00")
+                )).id(), "Bob");
+
+        // 重新關帳 1~12 月
+        setupFullYearPeriods(year);
+
+        // 第二次結帳
+        List<Long> close2 = ye.closeYear(year, "Amy", "Bob");
+        long voucher2 = close2.get(0);
+
+        // 驗證歷史紀錄完整保留
+        List<YearEndClosingService.YearEndClosingRecord> history = ye.getClosingHistory(year);
+        assertEquals(2, history.size(), "同年度應保留 2 筆結帳/反結歷史紀錄，禁止刪除歷史紀錄");
+
+        YearEndClosingService.YearEndClosingRecord rec1 = history.get(0);
+        assertEquals(1, rec1.closingSequence());
+        assertEquals("REVERSED", rec1.status());
+        assertEquals(voucher1, (long) rec1.voucherId());
+        assertEquals(rev1, (long) rec1.reverseVoucherId());
+        assertEquals("Amy", rec1.createdBy());
+        assertEquals("Bob", rec1.reviewedBy());
+        assertEquals("Bob", rec1.reopenInitiatedBy());
+        assertEquals("David", rec1.reopenReviewedBy());
+        assertEquals("補記費用", rec1.reopenReason());
+
+        YearEndClosingService.YearEndClosingRecord rec2 = history.get(1);
+        assertEquals(2, rec2.closingSequence());
+        assertEquals("POSTED", rec2.status());
+        assertEquals(voucher2, (long) rec2.voucherId());
+        assertNull(rec2.reverseVoucherId());
+        assertEquals("Amy", rec2.createdBy());
+        assertEquals("Bob", rec2.reviewedBy());
+    }
+
+    @Test
+    @DisplayName("R6-P1-03-09: 多次結帳後 checkConsistency() 不應誤判舊傳票為孤立資料")
+    void testR6_ConsistencyCheckDoesNotMisidentifyOldVouchersAsOrphan() throws SQLException {
+        int year = 2069;
+        voucherService.post(
+                voucherService.createDraft(year + "-01-15", "測試收入", "Amy", List.of(
+                        entry("1101", "2000.00", "0"),
+                        entry("4101", "0", "2000.00")
+                )).id(), "Bob");
+        setupFullYearPeriods(year);
+
+        YearEndClosingService ye = new YearEndClosingService();
+        ye.closeYear(year, "Amy", "Bob");
+        ye.reopenYear(year, "Bob", "David", "更正分錄");
+
+        setupFullYearPeriods(year);
+        ye.closeYear(year, "Amy", "Bob");
+
+        List<String> issues = ye.checkConsistency();
+        assertTrue(issues.isEmpty(), "多次結帳與反結後，checkConsistency() 不應將舊年結傳票與反結傳票誤判為孤立資料: " + issues);
+    }
+
+    @Test
+    @DisplayName("R6-P1-03-10: NOT_CHECKED 不得被 assertAllPass() 當成通過")
+    void testR6_NotCheckedMustNotPassInAssertAllPass() {
+        ReportReconciliationService recon = new ReportReconciliationService();
+
+        // 1. 測試當傳入含有 NOT_CHECKED 項目之清單時，assertAllPass 必須拋出異常拒絕通過
+        List<ReportReconciliationService.CheckResult> resultsWithNotChecked = List.of(
+                new ReportReconciliationService.CheckResult(
+                        "現金流量表期末現金 vs 帳列現金及約當現金",
+                        false,
+                        "現金流量表未產生期末現金資訊",
+                        0,
+                        0,
+                        ReportReconciliationService.CheckStatus.NOT_CHECKED
+                )
+        );
+        BusinessException ex1 = assertThrows(BusinessException.class, () ->
+                recon.assertAllPass(resultsWithNotChecked));
+        assertTrue(ex1.getMessage().contains("未完成") || ex1.getMessage().contains("未檢查"),
+                "存在 NOT_CHECKED 項目時不得宣稱全部通過: " + ex1.getMessage());
+
+        // 2. 測試日期無效或無法完成計算產生 NOT_CHECKED 時，assertAllPass(start, end) 必須拋出異常
+        BusinessException ex2 = assertThrows(BusinessException.class, () ->
+                recon.assertAllPass("invalid-date", "2099-12-31"));
+        assertTrue(ex2.getMessage().contains("未完成") || ex2.getMessage().contains("未檢查") || ex2.getMessage().contains("失敗"),
+                "無法核對產生 NOT_CHECKED 時不得宣稱通過: " + ex2.getMessage());
+    }
+
+    @Test
+    @DisplayName("R6-P1-03-11: 多執行緒同時登入失敗時，鎖定次數不會被競爭條件繞過")
+    void testR6_ConcurrentLoginFailuresLockoutNotBypassed() throws InterruptedException {
+        AuthService auth = new AuthService();
+        String testUser = "bob";
+
+        int threadCount = 10;
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(threadCount);
+        java.util.concurrent.CountDownLatch ready = new java.util.concurrent.CountDownLatch(threadCount);
+        java.util.concurrent.CountDownLatch start = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.CountDownLatch done = new java.util.concurrent.CountDownLatch(threadCount);
+
+        for (int i = 0; i < threadCount; i++) {
+            final int idx = i;
+            pool.submit(() -> {
+                ready.countDown();
+                try {
+                    start.await();
+                    auth.login(testUser, "wrongPassword" + idx);
+                } catch (Exception ignored) {
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+
+        ready.await();
+        start.countDown();
+        done.await();
+        pool.shutdown();
+
+        // 驗證帳號已被鎖定，即使輸入正確密碼也會被拒絕，競爭條件未繞過鎖定
+        BusinessException lockEx = assertThrows(BusinessException.class, () -> auth.login(testUser, "bob123"));
+        assertTrue(lockEx.getMessage().contains("登入失敗次數過多"), "多執行緒並行登入失敗後帳號必須被鎖定: " + lockEx.getMessage());
+
+        // 管理員重設密碼後可解鎖
+        auth.resetPassword(testUser, "BobNewPass123", "admin");
+        assertEquals("bob", auth.login(testUser, "BobNewPass123"));
     }
 }

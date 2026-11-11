@@ -11,6 +11,9 @@ public class App extends Application {
 
     @Override
     public void start(Stage primaryStage) throws Exception {
+        // 啟動時檢查並恢復未完成的年度結帳狀態
+        new com.ledger.service.YearEndClosingService().checkAndRecoverOnStartup();
+
         // 啟動時進入登入畫面
         FXMLLoader loader = new FXMLLoader(getClass().getResource("/fxml/login.fxml"));
         Parent root = loader.load();
