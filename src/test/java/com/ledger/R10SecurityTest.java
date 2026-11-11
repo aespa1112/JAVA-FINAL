@@ -217,7 +217,7 @@ public class R10SecurityTest {
                 SessionContext.setTenantId("first_t");
             }).get(3, TimeUnit.SECONDS);
 
-            String leaked = pool.submit(() -> {
+            pool.submit(() -> {
                 String u = SessionContext.getUser();
                 SessionContext.clear();
                 return u;
@@ -308,7 +308,6 @@ public class R10SecurityTest {
     void missingSchemaVersionFails() throws Exception {
         Path p = Paths.get("data/test_meta_damaged.db");
         Files.deleteIfExists(p);
- amplifies;
         try (Connection c = java.sql.DriverManager.getConnection("jdbc:sqlite:" + p);
              Statement st = c.createStatement()) {
             st.execute("CREATE TABLE system_meta (meta_key TEXT PRIMARY KEY, meta_value TEXT NOT NULL)");
