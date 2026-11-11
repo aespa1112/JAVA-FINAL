@@ -4,18 +4,21 @@ import com.ledger.exception.BusinessException;
 import com.ledger.model.OperatorRole;
 
 /**
- * 執行階段工作階段：登入使用者與目前帳套。
- * 正式環境（LEDGER_ENV=PRODUCTION 或未明確 DEMO）強制 requireUser，
- * 測試環境僅在明確設定 LEDGER_ENV=TEST 或 LEDGER_ALLOW_ANON=1 時允許免登入。
+ * Per-thread session context: logged-in user, display name, client path and tenant.
+ * All identity-bearing fields are ThreadLocal so concurrent requests / worker
+ * threads cannot overwrite each other.
+ * <p>
+ * Callers MUST clear the context (via clear() or try-finally) when a request
+ * or background task finishes, especially when threads are reused from a pool.
  */
 public final class SessionContext {
 
-    private static String currentUser;
-    private static String currentUserDisplay;
-    private static String currentClientPath;
-    private static volatile boolean enabled = true;
+    private static final ThreadLocal<String> currentUser = new ThreadLocal<>();
+    private static final ThreadLocal<String> currentUserDisplay = new ThreadLocal<>();
+    private static final ThreadLocal<String> currentClientPath = new ThreadLocal<>();
+    private static final ThreadLocal<String> currentTenantId = new ThreadLocal<>();
+    private static final ThreadLocal<Boolean> enabled = ThreadLocal.withInitial(() -> Boolean.TRUE);
 
-    /** 測試專用：明確啟用才允許無 Session 操作 */
     private static volatile boolean testIdentityProviderEnabled = false;
     private static volatile String testIdentityUser;
 
@@ -25,7 +28,6 @@ public final class SessionContext {
     public static boolean isProduction() {
         if (Boolean.getBoolean("ledger.test")) return false;
         String env = System.getenv().getOrDefault("LEDGER_ENV", "PRODUCTION");
-        // DEMO / TEST 必須明確設定；預設視為 PRODUCTION
         return !"DEMO".equalsIgnoreCase(env) && !"TEST".equalsIgnoreCase(env);
     }
 
@@ -38,9 +40,6 @@ public final class SessionContext {
                 || "1".equals(System.getenv("LEDGER_ALLOW_ANON"));
     }
 
-    /**
-     * 僅測試程式可呼叫。正式環境（未開 ledger.test / LEDGER_ENV=TEST）呼叫會拋例外。
-     */
     public static void enableTestIdentityProvider(String testUser) {
         if (isProduction()) {
             throw new BusinessException("正式環境禁止啟用測試身分提供者");
@@ -55,48 +54,63 @@ public final class SessionContext {
     }
 
     public static void setUser(String canonicalName, String displayName) {
-        currentUser = canonicalName;
-        currentUserDisplay = displayName;
-        enabled = true;
+        currentUser.set(canonicalName);
+        currentUserDisplay.set(displayName);
+        enabled.set(Boolean.TRUE);
     }
 
     public static String getUser() {
-        return currentUser;
+        return currentUser.get();
     }
 
     public static String getUserDisplay() {
-        return currentUserDisplay != null ? currentUserDisplay : currentUser;
+        String d = currentUserDisplay.get();
+        return d != null ? d : currentUser.get();
     }
 
     public static void setClientPath(String path) {
-        currentClientPath = path;
+        currentClientPath.set(path);
     }
 
     public static String getClientPath() {
-        return currentClientPath;
+        return currentClientPath.get();
+    }
+
+    public static void setTenantId(String tenantId) {
+        if (tenantId == null || tenantId.isBlank()) {
+            currentTenantId.remove();
+            return;
+        }
+        currentTenantId.set(TenantPathResolver.normalizeTenantId(tenantId));
+    }
+
+    public static String getTenantId() {
+        return currentTenantId.get();
     }
 
     public static void clear() {
-        currentUser = null;
-        currentUserDisplay = null;
-        currentClientPath = null;
-        enabled = true;
+        currentUser.remove();
+        currentUserDisplay.remove();
+        currentClientPath.remove();
+        currentTenantId.remove();
+        enabled.remove();
     }
 
     public static boolean isLoggedIn() {
-        return enabled && currentUser != null && !currentUser.isBlank();
+        Boolean e = enabled.get();
+        String u = currentUser.get();
+        return Boolean.TRUE.equals(e) && u != null && !u.isBlank();
     }
 
-    /** 停用帳號時呼叫，使現有 Session 立即失效 */
     public static void invalidate() {
-        enabled = false;
-        currentUser = null;
-        currentUserDisplay = null;
+        enabled.set(Boolean.FALSE);
+        currentUser.remove();
+        currentUserDisplay.remove();
     }
 
     public static String requireUser() {
         if (isLoggedIn()) {
-            return currentUser;
+            return currentUser.get();
         }
         if (isTestMode() && testIdentityProviderEnabled && testIdentityUser != null) {
             return testIdentityUser;
@@ -116,19 +130,13 @@ public final class SessionContext {
         return role;
     }
 
-    /**
-     * 正式環境：一律以 Session 為準，拒絕未登入與身分偽造。
-     * 測試模式（明確 TEST / 測試身分提供者）：允許傳入 operator。
-     * 不可在 Session 為 null 時信任呼叫端名稱（正式環境）。
-     */
     public static String resolveOperator(String requested) {
         if (isLoggedIn()) {
-            String session = currentUser;
+            String session = currentUser.get();
             if (requested != null && !requested.isBlank()) {
                 String req = requested.trim();
                 String sl = session.toLowerCase();
                 String rl = req.toLowerCase();
-                // 僅允許完全相同，或 UI 顯示名「amy (記帳員...)」形式；禁止「amy 審核」等偽冒
                 boolean ok = rl.equals(sl)
                         || rl.startsWith(sl + " (")
                         || rl.startsWith(sl + "(");
@@ -139,7 +147,6 @@ public final class SessionContext {
             }
             return session;
         }
-        // 未登入
         if (isTestMode() && testIdentityProviderEnabled) {
             if (requested != null && !requested.isBlank()) {
                 return OperatorRole.normalize(requested);
@@ -147,7 +154,6 @@ public final class SessionContext {
             return testIdentityUser != null ? testIdentityUser : "Amy";
         }
         if (isTestMode() && requested != null && !requested.isBlank()) {
-            // LEDGER_ENV=TEST 且未啟用 provider 時仍允許（相容舊測試）
             return OperatorRole.normalize(requested);
         }
         throw new BusinessException("尚未登入或 Session 已失效，拒絕操作（不可信任未經驗證的操作人名稱）");
