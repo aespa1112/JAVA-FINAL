@@ -1,6 +1,7 @@
 package com.ledger.service;
 
 import com.ledger.config.DbManager;
+import com.ledger.config.SessionContext;
 import com.ledger.dao.AuditDao;
 import com.ledger.exception.BusinessException;
 import com.ledger.model.OperatorRole;
@@ -18,7 +19,7 @@ public class OpeningBalanceService {
     private final AuditDao auditDao = new AuditDao();
 
     public long importOpening(String openingDate, List<OpeningLine> lines, String operator) {
-        String norm = OperatorRole.normalize(operator);
+        String norm = SessionContext.resolveOperator(operator);
         if (OperatorRole.resolve(norm) != OperatorRole.CHECKER) {
             throw new BusinessException("期初餘額匯入僅會計師可執行");
         }

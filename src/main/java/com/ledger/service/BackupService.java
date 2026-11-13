@@ -1,6 +1,7 @@
 package com.ledger.service;
 
 import com.ledger.config.DbManager;
+import com.ledger.config.SessionContext;
 import com.ledger.dao.AuditDao;
 import com.ledger.exception.BusinessException;
 import com.ledger.model.OperatorRole;
@@ -51,7 +52,7 @@ public class BackupService {
             throw new IOException("資料庫檔案不存在: " + dbFile);
         }
 
-        String normOp = OperatorRole.normalize(operator);
+        String normOp = SessionContext.resolveOperator(operator);
         if (OperatorRole.resolve(normOp) == OperatorRole.AUDITOR) {
             throw new BusinessException("權限不足：查帳員為唯讀身分，無權進行備份");
         }
@@ -89,7 +90,7 @@ public class BackupService {
     }
 
     public void restore(Path backupFile, Path targetDbFile, String operator) throws IOException {
-        String normOp = OperatorRole.normalize(operator);
+        String normOp = SessionContext.resolveOperator(operator);
         if (OperatorRole.resolve(normOp) != OperatorRole.CHECKER) {
             throw new BusinessException("權限不足：資料庫還原涉及重大資料覆蓋，僅會計師（Bob）有權操作！");
         }

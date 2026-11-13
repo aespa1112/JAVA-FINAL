@@ -290,15 +290,21 @@ public class R10SecurityTest {
         assertFalse(p.contains(".."));
     }
 
+    private static Connection openViaSwitch(Path p) throws SQLException {
+        DbManager.switchDatabase(p.toString().replace('\\', '/'));
+        return DbManager.get();
+    }
+
     @Test
     @DisplayName("R10-04a 全新資料庫初始化")
     void freshDbInit() throws Exception {
         Path p = Paths.get("data/test_fresh_r10.db");
         Files.deleteIfExists(p);
-        try (Connection c = DbManager.createRawConnection(p.toString())) {
+        try (Connection c = openViaSwitch(p)) {
             int v = DbManager.getSchemaVersion(c);
             assertEquals(DbManager.CURRENT_SCHEMA_VERSION, v);
         } finally {
+            DbManager.closeCurrent();
             Files.deleteIfExists(p);
         }
     }
@@ -316,12 +322,13 @@ public class R10SecurityTest {
         }
         try {
             SQLException ex = assertThrows(SQLException.class, () ->
-                    DbManager.createRawConnection(p.toString()));
+                    DbManager.switchDatabase(p.toString().replace('\\', '/')));
             assertTrue(ex.getMessage().contains("schema_version") ||
                     (ex.getCause() != null && ex.getCause().getMessage() != null
                             && ex.getCause().getMessage().contains("schema_version")),
                     "Expected schema_version error, got: " + ex.getMessage());
         } finally {
+            DbManager.closeCurrent();
             Files.deleteIfExists(p);
         }
     }
@@ -338,8 +345,10 @@ public class R10SecurityTest {
             st.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY)");
         }
         try {
-            assertThrows(SQLException.class, () -> DbManager.createRawConnection(p.toString()));
+            assertThrows(SQLException.class, () ->
+                    DbManager.switchDatabase(p.toString().replace('\\', '/')));
         } finally {
+            DbManager.closeCurrent();
             Files.deleteIfExists(p);
         }
     }
@@ -349,7 +358,7 @@ public class R10SecurityTest {
     void migrationSuccess() throws Exception {
         Path p = Paths.get("data/test_mig_ok.db");
         Files.deleteIfExists(p);
-        try (Connection c = DbManager.createRawConnection(p.toString())) {
+        try (Connection c = openViaSwitch(p)) {
             assertEquals(DbManager.CURRENT_SCHEMA_VERSION, DbManager.getSchemaVersion(c));
             try (Statement st = c.createStatement();
                  ResultSet rs = st.executeQuery(
@@ -357,6 +366,7 @@ public class R10SecurityTest {
                 assertTrue(rs.next() && rs.getInt(1) == 1);
             }
         } finally {
+            DbManager.closeCurrent();
             Files.deleteIfExists(p);
         }
     }
@@ -378,9 +388,11 @@ public class R10SecurityTest {
         });
 
         try {
-            assertThrows(SQLException.class, () -> DbManager.createRawConnection(p.toString()));
+            assertThrows(SQLException.class, () ->
+                    DbManager.switchDatabase(p.toString().replace('\\', '/')));
         } finally {
             DbManager.clearMigrationFailureHook();
+            DbManager.closeCurrent();
         }
 
         try (Connection c = java.sql.DriverManager.getConnection("jdbc:sqlite:" + p);

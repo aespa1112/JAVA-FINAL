@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS vouchers (
     reversed_id  INTEGER REFERENCES vouchers(id),
     created_at   TEXT    NOT NULL DEFAULT (datetime('now','localtime')),
     posted_at    TEXT,
+    voucher_type TEXT    NOT NULL DEFAULT 'NORMAL',
+    closing_year INTEGER,
     UNIQUE (period_id, voucher_no)
 );
 CREATE INDEX IF NOT EXISTS idx_vouchers_date ON vouchers(voucher_date);
@@ -189,11 +191,14 @@ INSERT OR IGNORE INTO accounts (code, name, type, normal_side, is_leaf, enabled)
 ('1141', '預付款項', 'ASSET', 'DEBIT', 1, 1),
 ('1201', '存貨', 'ASSET', 'DEBIT', 1, 1),
 ('1401', '不動產、廠房及設備', 'ASSET', 'DEBIT', 1, 1),
+('1402', '累計折舊', 'ASSET', 'CREDIT', 1, 1),
+('1501', '無形資產', 'ASSET', 'DEBIT', 1, 1),
 ('2101', '短期借款', 'LIABILITY', 'CREDIT', 1, 1),
 ('2121', '應付票據', 'LIABILITY', 'CREDIT', 1, 1),
 ('2122', '應付帳款', 'LIABILITY', 'CREDIT', 1, 1),
 ('2124', '應付薪資', 'LIABILITY', 'CREDIT', 1, 1),
 ('2125', '應付稅捐', 'LIABILITY', 'CREDIT', 1, 1),
+('2201', '長期借款', 'LIABILITY', 'CREDIT', 1, 1),
 ('3101', '普通股股本', 'EQUITY', 'CREDIT', 1, 1),
 ('3201', '資本公積', 'EQUITY', 'CREDIT', 1, 1),
 ('3301', '保留盈餘', 'EQUITY', 'CREDIT', 1, 1),
@@ -201,6 +206,7 @@ INSERT OR IGNORE INTO accounts (code, name, type, normal_side, is_leaf, enabled)
 ('4101', '銷貨收入', 'REVENUE', 'CREDIT', 1, 1),
 ('4102', '勞務收入', 'REVENUE', 'CREDIT', 1, 1),
 ('4201', '其他營業收入', 'REVENUE', 'CREDIT', 1, 1),
+('4202', '處分資產利益', 'REVENUE', 'CREDIT', 1, 1),
 ('5101', '銷貨成本', 'EXPENSE', 'DEBIT', 1, 1),
 ('5201', '薪資支出', 'EXPENSE', 'DEBIT', 1, 1),
 ('5202', '租金支出', 'EXPENSE', 'DEBIT', 1, 1),
@@ -210,4 +216,6 @@ INSERT OR IGNORE INTO accounts (code, name, type, normal_side, is_leaf, enabled)
 ('5206', '文具用品', 'EXPENSE', 'DEBIT', 1, 1),
 ('5207', '稅捐', 'EXPENSE', 'DEBIT', 1, 1),
 ('5208', '折舊費用', 'EXPENSE', 'DEBIT', 1, 1),
-('5301', '雜項支出', 'EXPENSE', 'DEBIT', 1, 1);
+('5209', '攤銷費用', 'EXPENSE', 'DEBIT', 1, 1),
+('5301', '雜項支出', 'EXPENSE', 'DEBIT', 1, 1),
+('5302', '處分資產損失', 'EXPENSE', 'DEBIT', 1, 1);

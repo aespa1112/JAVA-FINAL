@@ -106,6 +106,42 @@ public class VoucherService {
         }
     }
 
+    /**
+     * 建立期末決算調整分錄草稿（權責發生制：應計、預付/預收、折舊、攤銷等調整）。
+     * 傳票將標記 voucher_type = 'ADJUSTING' 以與一般交易分錄及結帳分錄區隔。
+     */
+    public Voucher createAdjustingDraft(String voucherDate, String summary, String preparer, List<VoucherEntry> entries) {
+        if (summary == null || summary.trim().isEmpty()) {
+            throw new BusinessException("調整分錄摘要不可為空");
+        }
+        String adjSummary = summary.trim().startsWith("[期末調整]") ? summary.trim() : "[期末調整] " + summary.trim();
+        try (Connection conn = DbManager.get()) {
+            boolean originAutoCommit = conn.getAutoCommit();
+            conn.setAutoCommit(false);
+            try {
+                Voucher created = createDraft(conn, voucherDate, adjSummary, null, preparer, entries);
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "UPDATE vouchers SET voucher_type = 'ADJUSTING' WHERE id = ?")) {
+                    ps.setLong(1, created.id());
+                    ps.executeUpdate();
+                }
+                conn.commit();
+                return created;
+            } catch (Exception e) {
+                conn.rollback();
+                logDeniedAttempt(conn, "CREATE_ADJUSTING_DRAFT", null, preparer, e.getMessage());
+                if (e instanceof BusinessException be) {
+                    throw be;
+                }
+                throw new BusinessException("建立決算調整傳票失敗: " + e.getMessage(), e);
+            } finally {
+                conn.setAutoCommit(originAutoCommit);
+            }
+        } catch (SQLException e) {
+            throw new BusinessException("資料庫操作異常: " + e.getMessage(), e);
+        }
+    }
+
     public Voucher createDraft(Connection conn, String voucherDate, String summary, String preparer, List<VoucherEntry> entries) {
         return createDraft(conn, voucherDate, summary, null, preparer, entries);
     }

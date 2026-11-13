@@ -16,6 +16,7 @@ import java.sql.SQLException;
 import java.time.LocalDate;
 import java.time.format.DateTimeParseException;
 import java.util.List;
+import java.util.Map;
 
 public class ReportService {
 
@@ -61,6 +62,15 @@ public class ReportService {
         }
     }
 
+    /** 明細分類帳 */
+    public Map<String, List<GeneralLedgerItem>> getSubLedger(String accountCodePrefix, String startDate, String endDate) {
+        try {
+            return reportDao.getSubLedger(accountCodePrefix, startDate, endDate);
+        } catch (SQLException e) {
+            throw new BusinessException("查詢明細分類帳失敗: " + e.getMessage(), e);
+        }
+    }
+
     /** 權益變動表 */
     public List<FinancialStatementItem> getEquityChanges(String startDate, String endDate) {
         try {
@@ -70,7 +80,7 @@ public class ReportService {
         }
     }
 
-    /** 現金流量表（簡化間接法） */
+    /** 現金流量表（完整間接法） */
     public List<FinancialStatementItem> getCashFlow(String startDate, String endDate) {
         try {
             return reportDaoExtra.getCashFlow(startDate, endDate);

@@ -1,6 +1,7 @@
 package com.ledger.service;
 
 import com.ledger.config.DbManager;
+import com.ledger.config.SessionContext;
 import com.ledger.dao.AccountDao;
 import com.ledger.dao.AuditDao;
 import com.ledger.exception.BusinessException;
@@ -33,7 +34,7 @@ public class AccountService {
     }
 
     public Account createAccount(String code, String name, String type, String normalSide, Long parentId, String operator) {
-        String normOp = OperatorRole.normalize(operator);
+        String normOp = SessionContext.resolveOperator(operator);
         if (OperatorRole.resolve(normOp) == OperatorRole.AUDITOR) {
             throw new BusinessException("權限不足：查帳員（" + normOp + "）為唯讀身分，無權新增會計科目");
         }

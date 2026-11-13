@@ -1,6 +1,7 @@
 package com.ledger.service;
 
 import com.ledger.config.DbManager;
+import com.ledger.config.SessionContext;
 import com.ledger.dao.AuditDao;
 import com.ledger.exception.BusinessException;
 import com.ledger.model.OperatorRole;
@@ -10,7 +11,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * 商業會計法第 38 條：憑證至少 5 年、帳簿及報表至少 10 年。
+ * 商業會計法第 38 條：憑證至少 5 年、帳簿及報表至少 10 年；
+ * 未結會計事項（如尚有草稿傳票或未完成年結案件）依法延長保存，不得銷毀。
  * 本服務記錄保存政策與銷毀核准，禁止未核准銷毀。
  */
 public class RetentionPolicyService {
@@ -62,6 +64,14 @@ public class RetentionPolicyService {
     }
 
     public boolean isEligibleForDestruction(String dataType, LocalDate recordDate, LocalDate asOf) {
+        return isEligibleForDestruction(dataType, recordDate, asOf, false);
+    }
+
+    public boolean isEligibleForDestruction(String dataType, LocalDate recordDate, LocalDate asOf,
+                                            boolean hasUnsettledMatters) {
+        if (hasUnsettledMatters) {
+            return false;
+        }
         int years = 5;
         try (Connection conn = DbManager.get()) {
             ensureTables(conn);
@@ -72,14 +82,47 @@ public class RetentionPolicyService {
                     if (rs.next()) years = rs.getInt(1);
                 }
             }
+            if (hasUnsettledMattersInDb(conn, recordDate)) {
+                return false;
+            }
         } catch (SQLException e) {
             throw new BusinessException(e.getMessage(), e);
         }
         return !recordDate.plusYears(years).isAfter(asOf);
     }
 
+    private static boolean hasUnsettledMattersInDb(Connection conn, LocalDate recordDate) throws SQLException {
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT 1 FROM vouchers WHERE status = 'DRAFT' AND voucher_date <= ? LIMIT 1")) {
+            ps.setString(1, recordDate.toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) return true;
+            }
+        }
+        boolean hasClosings = false;
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='year_end_closings'")) {
+            if (rs.next() && rs.getInt(1) > 0) hasClosings = true;
+        }
+        if (hasClosings) {
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT 1 FROM year_end_closings WHERE fiscal_year = ? " +
+                    "AND status IN ('DRAFT_CREATED', 'REOPEN_IN_PROGRESS') LIMIT 1")) {
+                ps.setInt(1, recordDate.getYear());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) return true;
+                }
+            }
+        }
+        return false;
+    }
+
     public void recordDestructionApproval(String dataType, String targetRef, String reason, String operator) {
-        String norm = OperatorRole.normalize(operator);
+        String norm = SessionContext.resolveOperator(operator);
+        if (OperatorRole.resolve(norm) != OperatorRole.CHECKER) {
+            throw new BusinessException("權限不足：僅會計師（CHECKER）可核准會計檔案銷毀紀錄");
+        }
         if (reason == null || reason.isBlank()) {
             throw new BusinessException("銷毀必須填寫原因");
         }

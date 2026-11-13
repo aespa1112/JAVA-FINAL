@@ -406,10 +406,9 @@ public class AuthService {
             if (ps.executeUpdate() == 0) throw new BusinessException("找不到帳號: " + user);
             if (!enabled) {
                 OperatorRole.unregister(user);
-                if (user.equalsIgnoreCase(SessionContext.getUser())) {
-                    SessionContext.invalidate();
-                }
+                SessionContext.invalidateUserSessions(user);
             } else {
+                SessionContext.clearUserRevocation(user);
                 UserAccount acc = getAccount(user);
                 if (acc != null) OperatorRole.register(user, acc.role());
             }
@@ -440,8 +439,9 @@ public class AuthService {
     
         }
     private void requireAdmin(String operator) {
-        UserAccount acc = getAccount(operator);
-        if (acc == null || acc.role() != OperatorRole.ADMIN) {
+        String normOp = SessionContext.resolveOperator(operator);
+        UserAccount acc = getAccount(normOp);
+        if (acc == null || acc.role() != OperatorRole.ADMIN || !acc.enabled()) {
             throw new BusinessException("僅系統管理員可管理人員帳號");
         }
     }

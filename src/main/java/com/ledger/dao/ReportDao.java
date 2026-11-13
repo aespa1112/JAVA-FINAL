@@ -8,7 +8,9 @@ import com.ledger.model.TrialBalanceItem;
 import java.sql.*;
 import java.time.LocalDate;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 public class ReportDao {
 
@@ -178,6 +180,32 @@ public class ReportDao {
         return list;
     }
 
+    /**
+     * 明細分類帳（依科目代碼前綴查詢各明細科目流水帳及期初/期末餘額）。
+     */
+    public Map<String, List<GeneralLedgerItem>> getSubLedger(String accountCodePrefix, String startDate, String endDate) throws SQLException {
+        try (Connection conn = DbManager.get()) {
+            return getSubLedger(conn, accountCodePrefix, startDate, endDate);
+        }
+    }
+
+    public Map<String, List<GeneralLedgerItem>> getSubLedger(Connection conn, String accountCodePrefix, String startDate, String endDate) throws SQLException {
+        String prefix = accountCodePrefix == null ? "" : accountCodePrefix.trim();
+        Map<String, List<GeneralLedgerItem>> result = new LinkedHashMap<>();
+        String sql = "SELECT id, code, name FROM accounts WHERE code LIKE ? ORDER BY code";
+        try (PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, prefix + "%");
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    long id = rs.getLong("id");
+                    String key = rs.getString("code") + " " + rs.getString("name");
+                    result.put(key, getGeneralLedger(conn, id, startDate, endDate));
+                }
+            }
+        }
+        return result;
+    }
+
     public List<FinancialStatementItem> getIncomeStatement(String startDate, String endDate) throws SQLException {
         try (Connection conn = DbManager.get()) {
             return getIncomeStatement(conn, startDate, endDate);
@@ -194,7 +222,8 @@ public class ReportDao {
                 "    SELECT e.account_id, e.debit_minor, e.credit_minor " +
                 "    FROM voucher_entries e " +
                 "    JOIN vouchers v ON v.id = e.voucher_id " +
-                "    WHERE v.status = 'POSTED' "
+                "    WHERE v.status = 'POSTED' " +
+                "      AND COALESCE(v.voucher_type, 'NORMAL') NOT IN ('YEAR_END_CLOSE', 'YEAR_END_REVERSE') "
         );
         List<String> params = new ArrayList<>();
         if (startDate != null && !startDate.trim().isEmpty()) {
@@ -275,7 +304,8 @@ public class ReportDao {
                 "    SELECT e.account_id, e.debit_minor, e.credit_minor, v.voucher_date " +
                 "    FROM voucher_entries e " +
                 "    JOIN vouchers v ON v.id = e.voucher_id " +
-                "    WHERE v.status = 'POSTED' "
+                "    WHERE v.status = 'POSTED' " +
+                "      AND COALESCE(v.voucher_type, 'NORMAL') NOT IN ('YEAR_END_CLOSE', 'YEAR_END_REVERSE') "
         );
         List<String> params = new ArrayList<>();
         params.add(yearStart);

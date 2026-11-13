@@ -17,24 +17,26 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Logger;
 
 /**
- * Database access manager with tenant isolation.
+ * Database access manager with tenant isolation and Connection Lease lifecycle.
  * <p>
  * Public entry points that return a Connection for a tenant MUST go through
  * TenantSecurityService authorization and TenantPathResolver path derivation.
  * Arbitrary external dbPath cannot be used to open a tenant database.
  * <p>
- * Connection lifecycle:
- * - The default / legacy single-connection path keeps one Connection open and
- *   returns a proxy that ignores close() (historical UI behaviour).
- * - Tenant connections are also pooled per path; closeTenant / closeAllTenants
- *   close connections known to this process. They do not (and cannot safely)
- *   force-close Connections still in use on other threads; callers should use
- *   try-with-resources only on Connections they themselves created via
- *   createRawConnection for short-lived work.
+ * Connection lifecycle (P0-02):
+ * - Every call to get() / getForTenant() / getForDb() leases a dedicated JDBC
+ *   Connection wrapped with a lifecycle proxy.
+ * - Calling close() on a leased Connection genuinely commits/rolls back any
+ *   unfinished transaction, closes the underlying SQLite Connection, and marks
+ *   the handle closed so subsequent operations fail with SQLException.
+ * - Concurrent threads receive independent leases and never share a single
+ *   physical Connection or overwrite each other's transactions.
  */
 public final class DbManager {
 
@@ -46,13 +48,13 @@ public final class DbManager {
             "PRAGMA journal_mode = WAL;",
             "PRAGMA foreign_keys = ON;",
             "PRAGMA synchronous = FULL;",
-            "PRAGMA busy_timeout = 5000;",
+            "PRAGMA busy_timeout = 15000;",
             "PRAGMA cache_size = -8000;"
     };
 
-    private static String currentDbPath = "data/client_A.db";
-    private static Connection currentConnection;
-    private static final Map<String, Connection> tenantConnections = new ConcurrentHashMap<>();
+    private static volatile String currentDbPath = "data/client_A.db";
+    private static final Map<String, Set<Connection>> activeLeases = new ConcurrentHashMap<>();
+    private static final Map<String, Object> pathLocks = new ConcurrentHashMap<>();
     private static final ThreadLocal<String> currentTenant = new ThreadLocal<>();
 
     private static volatile Runnable migrationFailureHook;
@@ -60,7 +62,12 @@ public final class DbManager {
     private DbManager() {
     }
 
-    public static synchronized Connection get() throws SQLException {
+    private static String normalizePathKey(String dbPath) {
+        if (dbPath == null) return "";
+        return dbPath.trim().replace('\\', '/');
+    }
+
+    public static Connection get() throws SQLException {
         String tenant = currentTenant.get();
         if (tenant != null && !tenant.isBlank()) {
             return getForTenant(tenant);
@@ -69,10 +76,7 @@ public final class DbManager {
         if (sessionTenant != null && !sessionTenant.isBlank()) {
             return getForTenant(sessionTenant);
         }
-        if (currentConnection == null || currentConnection.isClosed()) {
-            openConnection(currentDbPath);
-        }
-        return wrapNonClosing(currentConnection);
+        return leaseConnection(currentDbPath);
     }
 
     public static void setCurrentTenant(String tenantId) {
@@ -95,31 +99,36 @@ public final class DbManager {
         currentTenant.remove();
     }
 
-    public static synchronized Connection getForTenant(String tenantId) throws SQLException {
+    public static Connection getForTenant(String tenantId) throws SQLException {
         if (tenantId == null || tenantId.isBlank()) {
             throw new SecurityException("tenantId must not be blank");
         }
         TenantSecurityService.requireAuthorized(tenantId);
         String dbPath = TenantPathResolver.resolveDbPath(tenantId);
-        return getOrOpenTenantConnection(dbPath);
+        return leaseConnection(dbPath);
     }
 
-    static synchronized Connection getForDb(String dbPath) throws SQLException {
+    static Connection getForDb(String dbPath) throws SQLException {
         TenantPathResolver.assertSafePath(dbPath);
-        if (dbPath != null && dbPath.replace('\\', '/').startsWith(TenantPathResolver.TENANT_ROOT + "/")) {
+        String norm = normalizePathKey(dbPath);
+        if (norm.startsWith(TenantPathResolver.TENANT_ROOT + "/")) {
             throw new SecurityException(
                     "Tenant databases must be opened via getForTenant(tenantId), not by path");
         }
-        return getOrOpenTenantConnection(dbPath);
+        if (SessionContext.isProduction() && (":memory:".equalsIgnoreCase(norm) || !"data/client_A.db".equals(norm))) {
+            TenantSecurityService.requireAuthorized(extractClientIdFromPath(norm));
+        }
+        return leaseConnection(dbPath);
     }
 
-    private static Connection getOrOpenTenantConnection(String dbPath) throws SQLException {
-        Connection conn = tenantConnections.get(dbPath);
-        if (conn == null || conn.isClosed()) {
-            conn = createRawConnection(dbPath);
-            tenantConnections.put(dbPath, conn);
+    private static Connection leaseConnection(String dbPath) throws SQLException {
+        String normKey = normalizePathKey(dbPath);
+        Object lock = pathLocks.computeIfAbsent(normKey, k -> new Object());
+        Connection raw;
+        synchronized (lock) {
+            raw = createRawConnection(dbPath);
         }
-        return wrapNonClosing(conn);
+        return wrapLeasedConnection(raw, normKey);
     }
 
     @Deprecated
@@ -127,7 +136,7 @@ public final class DbManager {
         return TenantPathResolver.resolveDbPath(tenantId);
     }
 
-    public static synchronized void closeTenant(String tenantId) {
+    public static void closeTenant(String tenantId) {
         if (tenantId == null || tenantId.isBlank()) {
             clearCurrentTenant();
             return;
@@ -148,60 +157,78 @@ public final class DbManager {
         } catch (Exception e) {
             dbPath = resolveTenantDbPath(canonical);
         }
-        Connection conn = tenantConnections.remove(dbPath);
-        if (conn != null) {
-            try {
-                if (!conn.isClosed()) conn.close();
-            } catch (SQLException ignored) {
-            }
+        closeAllLeasesForPath(dbPath);
+    }
+
+    public static void closeAllTenants() {
+        List<String> keys = new ArrayList<>(activeLeases.keySet());
+        for (String key : keys) {
+            closeAllLeasesForPath(key);
+        }
+        activeLeases.clear();
+        currentTenant.remove();
+    }
+
+    private static void closeAllLeasesForPath(String dbPath) {
+        String normKey = normalizePathKey(dbPath);
+        Set<Connection> set = activeLeases.remove(normKey);
+        if (set == null) return;
+        for (Connection conn : new ArrayList<>(set)) {
+            closeUnderlyingQuietly(conn);
         }
     }
 
-    public static synchronized void closeAllTenants() {
-        for (Connection conn : tenantConnections.values()) {
-            if (conn != null) {
+    private static void closeUnderlyingQuietly(Connection conn) {
+        if (conn == null) return;
+        try {
+            if (!conn.isClosed()) {
                 try {
-                    if (!conn.isClosed()) conn.close();
+                    if (!conn.getAutoCommit()) {
+                        conn.rollback();
+                        conn.setAutoCommit(true);
+                    }
                 } catch (SQLException ignored) {
                 }
+                conn.close();
             }
+        } catch (SQLException ignored) {
         }
-        tenantConnections.clear();
-        closeCurrent();
-        currentTenant.remove();
     }
 
     public static synchronized void switchDatabase(String dbPath) throws SQLException {
         TenantPathResolver.assertSafePath(dbPath);
-        if (dbPath != null && dbPath.replace('\\', '/').startsWith(TenantPathResolver.TENANT_ROOT + "/")) {
+        String norm = normalizePathKey(dbPath);
+        if (norm.startsWith(TenantPathResolver.TENANT_ROOT + "/")) {
             throw new SecurityException("Use setCurrentTenant / getForTenant for tenant databases");
         }
+        if (SessionContext.isProduction()) {
+            if (":memory:".equalsIgnoreCase(norm)) {
+                throw new SecurityException("正式環境禁止使用 :memory: 測試資料庫");
+            }
+            if (!"data/client_A.db".equals(norm)) {
+                TenantSecurityService.requireAuthorized(extractClientIdFromPath(norm));
+            }
+        }
         closeCurrent();
+        String previous = currentDbPath;
         currentDbPath = dbPath;
-        openConnection(dbPath);
+        try (Connection ignored = leaseConnection(dbPath)) {
+            // Ensure schema migration / validation executes immediately on switch
+        } catch (SQLException | RuntimeException e) {
+            currentDbPath = previous;
+            throw e;
+        }
     }
 
-    public static synchronized String getCurrentDbPath() {
+    public static String getCurrentDbPath() {
         return currentDbPath;
     }
 
-    public static synchronized void closeCurrent() {
-        if (currentConnection != null) {
-            try {
-                if (!currentConnection.isClosed()) {
-                    currentConnection.close();
-                }
-            } catch (SQLException ignored) {
-            }
-            currentConnection = null;
-        }
+    public static void closeCurrent() {
+        closeAllLeasesForPath(currentDbPath);
     }
 
-    private static void openConnection(String dbPath) throws SQLException {
-        currentConnection = createRawConnection(dbPath);
-    }
-
-    public static Connection createRawConnection(String dbPath) throws SQLException {
+    static Connection createRawConnection(String dbPath) throws SQLException {
         boolean isMemory = ":memory:".equalsIgnoreCase(dbPath);
         if (!isMemory) {
             Path path = Paths.get(dbPath);
@@ -236,20 +263,44 @@ public final class DbManager {
         }
     }
 
-    private static Connection wrapNonClosing(Connection target) {
-        final Connection targetConn = target;
+    private static Connection wrapLeasedConnection(Connection realConnection, String normKey) {
+        activeLeases.computeIfAbsent(normKey, k -> ConcurrentHashMap.newKeySet()).add(realConnection);
+        AtomicBoolean closed = new AtomicBoolean(false);
         return (Connection) Proxy.newProxyInstance(
                 Connection.class.getClassLoader(),
                 new Class<?>[]{Connection.class},
                 (proxy, method, args) -> {
-                    if ("close".equals(method.getName())) {
+                    String name = method.getName();
+                    if ("equals".equals(name)) {
+                        return proxy == (args != null && args.length > 0 ? args[0] : null);
+                    }
+                    if ("hashCode".equals(name)) {
+                        return System.identityHashCode(proxy);
+                    }
+                    if ("toString".equals(name)) {
+                        return "LeasedConnection[" + normKey + ", closed=" + closed.get() + "]";
+                    }
+                    if ("close".equals(name)) {
+                        if (closed.compareAndSet(false, true)) {
+                            Set<Connection> set = activeLeases.get(normKey);
+                            if (set != null) {
+                                set.remove(realConnection);
+                            }
+                            closeUnderlyingQuietly(realConnection);
+                        }
                         return null;
                     }
-                    if ("isClosed".equals(method.getName())) {
-                        return targetConn == null || targetConn.isClosed();
+                    if ("isClosed".equals(name)) {
+                        return closed.get() || realConnection.isClosed();
+                    }
+                    if ("isValid".equals(name) && closed.get()) {
+                        return false;
+                    }
+                    if (closed.get()) {
+                        throw new SQLException("Connection lease is already closed");
                     }
                     try {
-                        return method.invoke(targetConn, args);
+                        return method.invoke(realConnection, args);
                     } catch (java.lang.reflect.InvocationTargetException e) {
                         throw e.getCause();
                     }
@@ -259,9 +310,19 @@ public final class DbManager {
 
     public static void applyPragmas(Connection conn) throws SQLException {
         try (Statement st = conn.createStatement()) {
-            for (String pragma : PRAGMAS) {
-                st.execute(pragma);
+            st.execute("PRAGMA busy_timeout = 15000;");
+            boolean alreadyWal = false;
+            try (ResultSet rs = st.executeQuery("PRAGMA journal_mode;")) {
+                if (rs.next() && "wal".equalsIgnoreCase(rs.getString(1))) {
+                    alreadyWal = true;
+                }
             }
+            if (!alreadyWal) {
+                st.execute("PRAGMA journal_mode = WAL;");
+            }
+            st.execute("PRAGMA foreign_keys = ON;");
+            st.execute("PRAGMA synchronous = FULL;");
+            st.execute("PRAGMA cache_size = -8000;");
         }
     }
 
@@ -344,6 +405,7 @@ public final class DbManager {
             }
         } else {
             ensureSystemMetaSchemaVersionSynced(conn, CURRENT_SCHEMA_VERSION);
+            ensureExtendedColumnsAndAccounts(conn);
         }
     }
 
@@ -486,6 +548,67 @@ public final class DbManager {
         try (Statement st = conn.createStatement()) {
             st.execute("CREATE TABLE IF NOT EXISTS system_meta (meta_key TEXT PRIMARY KEY, meta_value TEXT NOT NULL);");
             st.execute("CREATE TABLE IF NOT EXISTS voucher_sequences (prefix TEXT PRIMARY KEY, last_seq INTEGER NOT NULL);");
+        }
+        ensureExtendedColumnsAndAccounts(conn);
+    }
+
+    private static void ensureExtendedColumnsAndAccounts(Connection conn) throws SQLException {
+        boolean hasVouchers = false;
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='vouchers'")) {
+            if (rs.next() && rs.getInt(1) > 0) {
+                hasVouchers = true;
+            }
+        }
+        if (hasVouchers) {
+            boolean hasVoucherType = false;
+            boolean hasClosingYear = false;
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery("PRAGMA table_info(vouchers)")) {
+                while (rs.next()) {
+                    String col = rs.getString("name");
+                    if ("voucher_type".equalsIgnoreCase(col)) hasVoucherType = true;
+                    if ("closing_year".equalsIgnoreCase(col)) hasClosingYear = true;
+                }
+            }
+            if (!hasVoucherType || !hasClosingYear) {
+                try (Statement st = conn.createStatement()) {
+                    if (!hasVoucherType) {
+                        st.execute("ALTER TABLE vouchers ADD COLUMN voucher_type TEXT NOT NULL DEFAULT 'NORMAL'");
+                    }
+                    if (!hasClosingYear) {
+                        st.execute("ALTER TABLE vouchers ADD COLUMN closing_year INTEGER");
+                    }
+                }
+            }
+        }
+        boolean hasAccounts = false;
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='accounts'")) {
+            if (rs.next() && rs.getInt(1) > 0) {
+                hasAccounts = true;
+            }
+        }
+        if (hasAccounts) {
+            int present = 0;
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery(
+                         "SELECT count(*) FROM accounts WHERE code IN ('1402','1501','2201','4202','5209','5302')")) {
+                if (rs.next()) present = rs.getInt(1);
+            }
+            if (present < 6) {
+                try (Statement st = conn.createStatement()) {
+                    st.execute("INSERT OR IGNORE INTO accounts (code, name, type, normal_side, is_leaf, enabled) VALUES " +
+                            "('1402', '累計折舊', 'ASSET', 'CREDIT', 1, 1)," +
+                            "('1501', '無形資產', 'ASSET', 'DEBIT', 1, 1)," +
+                            "('2201', '長期借款', 'LIABILITY', 'CREDIT', 1, 1)," +
+                            "('4202', '處分資產利益', 'REVENUE', 'CREDIT', 1, 1)," +
+                            "('5209', '攤銷費用', 'EXPENSE', 'DEBIT', 1, 1)," +
+                            "('5302', '處分資產損失', 'EXPENSE', 'DEBIT', 1, 1);");
+                }
+            }
         }
     }
 

@@ -150,6 +150,24 @@ public class ReportReconciliationService {
                             actualCash,
                             match ? CheckStatus.PASSED : CheckStatus.FAILED
                     ));
+
+                    long bsCash = 0;
+                    for (FinancialStatementItem item : bs) {
+                        if ("1101".equals(item.code()) || "1102".equals(item.code())) {
+                            bsCash += item.amountMinor();
+                        }
+                    }
+                    boolean bsCfMatch = (bsCash == actualCash);
+                    results.add(new CheckResult(
+                            "資產負債表期末現金 vs 現金流量表帳列現金",
+                            bsCfMatch,
+                            bsCfMatch
+                                    ? String.format("資負現金 (%d 分) 與現金流量表帳列現金 (%d 分) 一致", bsCash, actualCash)
+                                    : String.format("資負現金 (%d 分) 與現金流量表帳列現金 (%d 分) 不一致，差額=%d 分", bsCash, actualCash, bsCash - actualCash),
+                            bsCash,
+                            actualCash,
+                            bsCfMatch ? CheckStatus.PASSED : CheckStatus.FAILED
+                    ));
                 } else {
                     results.add(new CheckResult(
                             "現金流量表期末現金 vs 帳列現金及約當現金",
