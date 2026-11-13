@@ -18,6 +18,25 @@ import javax.crypto.spec.PBEKeySpec;
 
 public class AuthService {
 
+    public static final class SessionToken {
+        private final String username;
+        private final String displayName;
+        private final OperatorRole role;
+        private final boolean enabled;
+
+        private SessionToken(String username, String displayName, OperatorRole role, boolean enabled) {
+            this.username = username;
+            this.displayName = displayName;
+            this.role = role;
+            this.enabled = enabled;
+        }
+
+        public String username() { return username; }
+        public String displayName() { return displayName; }
+        public OperatorRole role() { return role; }
+        public boolean enabled() { return enabled; }
+    }
+
     public record UserAccount(String username, String displayName, OperatorRole role, boolean enabled) {}
 
     private static final String DB_PATH = "data/system_users.db";
@@ -247,11 +266,22 @@ public class AuthService {
                                         ups.executeUpdate();
                                     }
                                 }
+                                String rawUser = rs.getString("username");
+                                String displayName = rs.getString("display_name");
+                                OperatorRole role = OperatorRole.valueOf(rs.getString("role"));
+                                boolean isEnabled = rs.getInt("enabled") == 1;
                                 conn.commit();
-                                String canonical = rs.getString("username");
-                                OperatorRole.register(canonical, OperatorRole.valueOf(rs.getString("role")));
+
+                                OperatorRole.register(rawUser, role);
+                                String canonical;
+                                try {
+                                    canonical = OperatorRole.normalize(rawUser);
+                                } catch (BusinessException ignored) {
+                                    canonical = rawUser;
+                                }
+                                SessionContext.establishSession(new SessionToken(canonical, displayName, role, isEnabled));
                                 auditAuth("LOGIN_OK", canonical, "success");
-                                return canonical;
+                                return rawUser;
                             }
                         }
                     } catch (SQLException e) {

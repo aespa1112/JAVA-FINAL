@@ -13,39 +13,76 @@ import java.util.Map;
  * <p>
  * 涵蓋：
  * - 營業活動：本期淨利、折舊及攤銷費用加回（5208/5209）、處分資產損益調整（4202/5302）、營運資金變動
- * - 投資活動：不動產廠房設備（14xx）、無形資產（15xx）及處分資產價款調整
+ * - 投資活動：依交易現金流辨識不動產廠房設備（14xx）及無形資產（15xx）價款，排除累計折舊（1402/1502）與非現金交易
  * - 籌資活動：短期/長期借款（2101/22xx）、股本（31xx）、資本公積（32xx）及保留盈餘直接變動（3301）
  * - 非現金投資及籌資活動揭露（NON_CASH）
- * - 自動排除結帳/反結帳分錄（YEAR_END_CLOSE / YEAR_END_REVERSE）並與總帳期初、期末現金核對
+ * - 可擴充科目分類規則並與總帳期初、期末現金餘額勾稽
  */
 public class ReportDaoExtra {
 
     public enum CashFlowCategory {
         CASH,
         OPERATING_WC,
+        ACCUM_DEPR_AMORT,
         INVESTING,
         FINANCING,
+        DEPR_AMORT_EXPENSE,
+        DISPOSAL_GAIN_LOSS,
         REVENUE,
         EXPENSE
+    }
+
+    private static final java.util.concurrent.ConcurrentHashMap<String, CashFlowCategory> CUSTOM_CLASSIFICATIONS =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * 註冊可設定的會計科目現金流量分類覆寫規則。
+     */
+    public static void registerAccountClassification(String accountCode, CashFlowCategory category) {
+        if (accountCode == null || accountCode.isBlank() || category == null) {
+            throw new IllegalArgumentException("科目代碼與現金流量分類不可為空");
+        }
+        CUSTOM_CLASSIFICATIONS.put(accountCode.trim(), category);
+    }
+
+    /**
+     * 清除所有自訂現金流量分類覆寫規則。
+     */
+    public static void clearCustomClassifications() {
+        CUSTOM_CLASSIFICATIONS.clear();
     }
 
     public static CashFlowCategory classifyAccount(String code, String type) {
         if (code == null) return CashFlowCategory.OPERATING_WC;
         String c = code.trim();
+        CashFlowCategory custom = CUSTOM_CLASSIFICATIONS.get(c);
+        if (custom != null) {
+            return custom;
+        }
         if ("1101".equals(c) || "1102".equals(c)) {
             return CashFlowCategory.CASH;
         }
-        if ("4202".equals(c) || "REVENUE".equalsIgnoreCase(type)) {
+        // 累計折舊（1402）與累計攤銷（1502）為資產減項評價科目，不得併入投資活動現金流
+        if ("1402".equals(c) || "1502".equals(c)) {
+            return CashFlowCategory.ACCUM_DEPR_AMORT;
+        }
+        if ("5208".equals(c) || "5209".equals(c)) {
+            return CashFlowCategory.DEPR_AMORT_EXPENSE;
+        }
+        if ("4202".equals(c) || "5302".equals(c)) {
+            return CashFlowCategory.DISPOSAL_GAIN_LOSS;
+        }
+        if ("REVENUE".equalsIgnoreCase(type)) {
             return CashFlowCategory.REVENUE;
         }
-        if ("5208".equals(c) || "5209".equals(c) || "5302".equals(c) || "EXPENSE".equalsIgnoreCase(type)) {
+        if ("EXPENSE".equalsIgnoreCase(type)) {
             return CashFlowCategory.EXPENSE;
         }
         if (c.startsWith("14") || c.startsWith("15")) {
             return CashFlowCategory.INVESTING;
         }
-        if ("2101".equals(c) || c.startsWith("22") || c.startsWith("31") || c.startsWith("32") || "3301".equals(c) || "3302".equals(c)
-                || "EQUITY".equalsIgnoreCase(type)) {
+        if ("2101".equals(c) || c.startsWith("22") || c.startsWith("31") || c.startsWith("32")
+                || "3301".equals(c) || "3302".equals(c) || "EQUITY".equalsIgnoreCase(type)) {
             return CashFlowCategory.FINANCING;
         }
         return CashFlowCategory.OPERATING_WC;
@@ -125,35 +162,97 @@ public class ReportDaoExtra {
         long disposalGain = 0;
         long disposalLoss = 0;
         long wcNet = 0;
-        long invRawNet = 0;
-        long finNet = 0;
+        long invCashNet = 0;
+        long finCashNet = 0;
         long nonCashInvFinTotal = 0;
 
         for (List<EntryRow> rows : vouchers.values()) {
             boolean hasCash = false;
             boolean hasDeprOrAmort = false;
             boolean hasDisposal = false;
-            boolean touchesInvOrFin = false;
-            long invFinDr = 0;
-            long invFinCr = 0;
+            boolean touchesInvesting = false;
+            boolean touchesFinancing = false;
+            long nonCashBasisDr = 0;
+            long nonCashBasisCr = 0;
 
             for (EntryRow r : rows) {
                 CashFlowCategory cat = classifyAccount(r.code(), r.type());
-                if (cat == CashFlowCategory.CASH) hasCash = true;
-                if ("5208".equals(r.code()) || "5209".equals(r.code())) hasDeprOrAmort = true;
-                if ("4202".equals(r.code()) || "5302".equals(r.code())) hasDisposal = true;
-                if (cat == CashFlowCategory.INVESTING || cat == CashFlowCategory.FINANCING) {
-                    touchesInvOrFin = true;
-                    invFinDr += r.debitMinor();
-                    invFinCr += r.creditMinor();
+                switch (cat) {
+                    case CASH -> hasCash = true;
+                    case DEPR_AMORT_EXPENSE -> hasDeprOrAmort = true;
+                    case DISPOSAL_GAIN_LOSS -> hasDisposal = true;
+                    case INVESTING -> {
+                        touchesInvesting = true;
+                        nonCashBasisDr += r.debitMinor();
+                        nonCashBasisCr += r.creditMinor();
+                    }
+                    case FINANCING -> {
+                        touchesFinancing = true;
+                        nonCashBasisDr += r.debitMinor();
+                        nonCashBasisCr += r.creditMinor();
+                    }
+                    default -> {
+                        // Other categories checked in second pass
+                    }
                 }
             }
 
-            if (!hasCash && !hasDeprOrAmort && !hasDisposal && touchesInvOrFin) {
-                nonCashInvFinTotal += Math.max(invFinDr, invFinCr);
+            if (!hasCash) {
+                // 非現金投資/籌資交易（如賒購設備、債務轉增資等）不計入各類現金流量，僅單獨揭露
+                if ((touchesInvesting || touchesFinancing) && !hasDeprOrAmort) {
+                    nonCashInvFinTotal += Math.max(nonCashBasisDr, nonCashBasisCr);
+                    // 若為非現金處分（如應收處分設備款），保留損益以便間接法自淨利加回/扣除，不影響 CFO/CFI
+                    if (hasDisposal) {
+                        for (EntryRow r : rows) {
+                            CashFlowCategory cat = classifyAccount(r.code(), r.type());
+                            if (cat == CashFlowCategory.DISPOSAL_GAIN_LOSS) {
+                                long crMinusDr = r.creditMinor() - r.debitMinor();
+                                if (crMinusDr >= 0) {
+                                    revNet += crMinusDr;
+                                    disposalGain += crMinusDr;
+                                } else {
+                                    expNet += -crMinusDr;
+                                    disposalLoss += -crMinusDr;
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // 純折舊與攤銷提列傳票（不含現金收付）只影響淨利及折舊攤銷加回，不計入投資現金流
+                for (EntryRow r : rows) {
+                    CashFlowCategory cat = classifyAccount(r.code(), r.type());
+                    long crMinusDr = r.creditMinor() - r.debitMinor();
+                    long drMinusCr = r.debitMinor() - r.creditMinor();
+                    switch (cat) {
+                        case REVENUE -> revNet += crMinusDr;
+                        case EXPENSE -> expNet += drMinusCr;
+                        case DEPR_AMORT_EXPENSE -> {
+                            expNet += drMinusCr;
+                            deprAmort += drMinusCr;
+                        }
+                        case DISPOSAL_GAIN_LOSS -> {
+                            if (crMinusDr >= 0) {
+                                revNet += crMinusDr;
+                                disposalGain += crMinusDr;
+                            } else {
+                                expNet += -crMinusDr;
+                                disposalLoss += -crMinusDr;
+                            }
+                        }
+                        case OPERATING_WC -> wcNet += crMinusDr;
+                        case ACCUM_DEPR_AMORT, INVESTING, FINANCING, CASH -> {
+                            // Non-cash contra-asset / asset lines excluded from cash investing/financing
+                        }
+                    }
+                }
                 continue;
             }
 
+            // 含現金收付之傳票：逐張計算資產處分實際收取／支付之現金金額
+            long voucherInvNet = 0;
+            long voucherDisposalAdjInCash = 0;
             for (EntryRow r : rows) {
                 CashFlowCategory cat = classifyAccount(r.code(), r.type());
                 long crMinusDr = r.creditMinor() - r.debitMinor();
@@ -161,35 +260,43 @@ public class ReportDaoExtra {
 
                 switch (cat) {
                     case CASH -> {
-                        // Cash side is what we reconcile against
+                        // Reconciled target
                     }
-                    case REVENUE -> {
-                        revNet += crMinusDr;
-                        if ("4202".equals(r.code())) {
-                            disposalGain += crMinusDr;
-                        }
-                    }
-                    case EXPENSE -> {
+                    case REVENUE -> revNet += crMinusDr;
+                    case EXPENSE -> expNet += drMinusCr;
+                    case DEPR_AMORT_EXPENSE -> {
                         expNet += drMinusCr;
-                        if ("5208".equals(r.code()) || "5209".equals(r.code())) {
-                            deprAmort += drMinusCr;
+                        deprAmort += drMinusCr;
+                    }
+                    case DISPOSAL_GAIN_LOSS -> {
+                        if (crMinusDr >= 0) {
+                            revNet += crMinusDr;
+                            disposalGain += crMinusDr;
+                        } else {
+                            expNet += -crMinusDr;
+                            disposalLoss += -crMinusDr;
                         }
-                        if ("5302".equals(r.code())) {
-                            disposalLoss += drMinusCr;
-                        }
+                        voucherDisposalAdjInCash += crMinusDr;
                     }
                     case OPERATING_WC -> wcNet += crMinusDr;
-                    case INVESTING -> invRawNet += crMinusDr;
-                    case FINANCING -> finNet += crMinusDr;
+                    case INVESTING, ACCUM_DEPR_AMORT -> {
+                        if (touchesInvesting || hasDisposal) {
+                            voucherInvNet += crMinusDr;
+                        }
+                    }
+                    case FINANCING -> finCashNet += crMinusDr;
                 }
+            }
+            if (touchesInvesting || hasDisposal) {
+                invCashNet += (voucherInvNet + voucherDisposalAdjInCash);
             }
         }
 
         long ni = revNet - expNet;
         long disposalAdj = disposalLoss - disposalGain;
         long operating = ni + deprAmort + disposalAdj + wcNet;
-        long investing = invRawNet - deprAmort - disposalAdj;
-        long financing = finNet;
+        long investing = invCashNet;
+        long financing = finCashNet;
 
         long netChange = operating + investing + financing;
         long beginCash = cashBalanceBefore(conn, startDate);
@@ -210,6 +317,20 @@ public class ReportDaoExtra {
         list.add(new FinancialStatementItem("合計", "END_CASH", "期末現金及約當現金（推算）", endCash));
         list.add(new FinancialStatementItem("合計", "ACTUAL_CASH", "期末現金及約當現金（帳列）", actualEndCash));
         return list;
+    }
+
+    /**
+     * 檢查推算之期末現金是否與總帳帳列期末現金完全勾稽。
+     */
+    public static boolean isCashReconciled(List<FinancialStatementItem> cashFlowItems) {
+        if (cashFlowItems == null || cashFlowItems.isEmpty()) return false;
+        Long endCash = null;
+        Long actualCash = null;
+        for (FinancialStatementItem item : cashFlowItems) {
+            if ("END_CASH".equals(item.code())) endCash = item.amountMinor();
+            if ("ACTUAL_CASH".equals(item.code())) actualCash = item.amountMinor();
+        }
+        return endCash != null && endCash.equals(actualCash);
     }
 
     private long periodNetIncome(Connection conn, String start, String end) throws SQLException {

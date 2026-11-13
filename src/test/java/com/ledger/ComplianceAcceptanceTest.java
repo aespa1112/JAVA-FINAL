@@ -14,6 +14,8 @@ import com.ledger.model.VoucherEntry;
 import com.ledger.service.*;
 import com.ledger.util.MoneyUtil;
 import org.junit.jupiter.api.*;
+import org.junit.jupiter.api.condition.EnabledOnOs;
+import org.junit.jupiter.api.condition.OS;
 
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
@@ -29,6 +31,7 @@ import java.time.LocalDate;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -59,6 +62,9 @@ public class ComplianceAcceptanceTest {
         Files.deleteIfExists(Paths.get(COMP_DB));
         Files.deleteIfExists(Paths.get(COMP_DB + "-wal"));
         Files.deleteIfExists(Paths.get(COMP_DB + "-shm"));
+        Files.deleteIfExists(Paths.get("data/system_users.db"));
+        Files.deleteIfExists(Paths.get("data/system_users.db-wal"));
+        Files.deleteIfExists(Paths.get("data/system_users.db-shm"));
         DbManager.switchDatabase(COMP_DB);
     }
 
@@ -191,13 +197,13 @@ public class ComplianceAcceptanceTest {
         try {
             // Worker thread logs in as Bob
             pool.submit(() -> {
-                SessionContext.setUser("Bob", "會計師 Bob");
+                auth.login("bob", "bob123");
                 assertTrue(SessionContext.isLoggedIn());
                 return null;
             }).get(5, TimeUnit.SECONDS);
 
             // Admin disables Bob on main thread
-            SessionContext.setUser("Admin", "系統管理員");
+            auth.login("admin", "admin123");
             auth.setEnabled("bob", false, "Admin");
 
             // Worker thread tries to resolve Bob's operator identity -> must fail!
@@ -209,13 +215,14 @@ public class ComplianceAcceptanceTest {
                 return null;
             }).get(5, TimeUnit.SECONDS);
         } finally {
+            auth.login("admin", "admin123");
             auth.setEnabled("bob", true, "Admin");
             SessionContext.clear();
             pool.shutdownNow();
         }
 
-        // Anti-spoofing across AccountService, OpeningBalanceService, RetentionPolicyService, AttachmentService
-        SessionContext.setUser("Amy", "記帳員 Amy");
+        // Anti-spoofing across AccountService, OpeningBalanceService, RetentionPolicyService
+        auth.login("amy", "amy123");
         try {
             assertThrows(BusinessException.class, () ->
                     new AccountService().createAccount("1199", "測試", "ASSET", "DEBIT", null, "Bob"));
@@ -223,7 +230,8 @@ public class ComplianceAcceptanceTest {
                     new OpeningBalanceService().importOpening("2027-01-01",
                             List.of(new OpeningBalanceService.OpeningLine("1101", 1000, 0, "")), "Bob"));
             assertThrows(BusinessException.class, () ->
-                    retentionService.recordDestructionApproval("VOUCHER", "V-1", "test", "Bob"));
+                    retentionService.recordDestructionApproval("BATCH-SPOOF", "VOUCHER", "V-1",
+                            LocalDate.of(2015, 1, 1), LocalDate.of(2027, 1, 1), "test", "Bob"));
         } finally {
             SessionContext.clear();
         }
@@ -327,7 +335,10 @@ public class ComplianceAcceptanceTest {
             if (storedCopy != null) Files.deleteIfExists(storedCopy);
         }
 
-        // 保存年限：憑證 5 年，帳簿報表 10 年；若有未結事項不得銷毀
+        // 保存年限：憑證 5 年，帳簿報表 10 年（須先登錄年度決算完成日作為起算點）；若有未結事項不得銷毀
+        retentionService.recordAnnualClosingCompletion(2020, LocalDate.of(2021, 5, 1), "Bob");
+        retentionService.recordAnnualClosingCompletion(2021, LocalDate.of(2021, 12, 31), "Bob");
+        retentionService.recordAnnualClosingCompletion(2023, LocalDate.of(2024, 5, 1), "Bob");
         assertFalse(retentionService.isEligibleForDestruction("VOUCHER", LocalDate.of(2023, 1, 1), LocalDate.of(2027, 1, 1)));
         assertTrue(retentionService.isEligibleForDestruction("VOUCHER", LocalDate.of(2021, 12, 31), LocalDate.of(2027, 1, 1)));
         assertFalse(retentionService.isEligibleForDestruction("BOOK", LocalDate.of(2021, 12, 31), LocalDate.of(2027, 1, 1)));
@@ -342,9 +353,12 @@ public class ComplianceAcceptanceTest {
         assertFalse(retentionService.isEligibleForDestruction("VOUCHER", LocalDate.of(2020, 12, 31), LocalDate.of(2030, 1, 1)),
                 "尚有歷史未過帳草稿應延長保存");
 
+        retentionService.recordAnnualClosingCompletion(2015, LocalDate.of(2016, 5, 1), "Bob");
         assertThrows(BusinessException.class, () ->
-                retentionService.recordDestructionApproval("VOUCHER", "2015", "過期", "Amy"));
-        retentionService.recordDestructionApproval("VOUCHER", "2015-BATCH", "已逾法定5年無未結事項", "Bob");
+                retentionService.recordDestructionApproval("BATCH-2015", "VOUCHER", "2015",
+                        LocalDate.of(2015, 12, 31), LocalDate.of(2027, 1, 1), "過期", "Amy"));
+        retentionService.recordDestructionApproval("BATCH-2015", "VOUCHER", "2015-BATCH",
+                LocalDate.of(2015, 12, 31), LocalDate.of(2027, 1, 1), "已逾法定5年無未結事項", "Bob");
     }
 
     @Test
@@ -412,5 +426,363 @@ public class ComplianceAcceptanceTest {
 
         // 全報表勾稽在年結後仍應全數通過
         reconciliationService.assertAllPass("2028-01-01", "2028-12-31");
+    }
+
+    @Test
+    @DisplayName("R12-P0-01: SessionContext.setUser 不可公開存取、外部禁止 establishSession、停用帳號無法登入與復辟")
+    void r12_p0_01_sessionIdentityBypassBlocked() throws Exception {
+        Method setUserMethod = SessionContext.class.getDeclaredMethod("setUser", String.class, String.class);
+        assertTrue(Modifier.isPrivate(setUserMethod.getModifiers()), "SessionContext.setUser 必須為 private");
+
+        // 非 AuthService 呼叫 establishSession 必須拋出 SecurityException
+        assertThrows(SecurityException.class, () -> SessionContext.establishSession(null));
+
+        // 缺少 sessionId 時 isLoggedIn 不得有舊版 fallback
+        SessionContext.clear();
+        assertFalse(SessionContext.isLoggedIn());
+        assertThrows(BusinessException.class, SessionContext::requireUser);
+
+        // 停用帳號不可登入建立新 Session，且 isUserRevoked 維持 true
+        AuthService auth = new AuthService();
+        auth.login("admin", "admin123");
+        try {
+            auth.setEnabled("david", false, "Admin");
+            assertTrue(SessionContext.isUserRevoked("David"));
+            SessionContext.clear();
+            assertThrows(BusinessException.class, () -> auth.login("david", "david123"),
+                    "停用帳號不得透過 login 建立新 Session");
+            assertFalse(SessionContext.isLoggedIn());
+        } finally {
+            auth.login("admin", "admin123");
+            auth.setEnabled("david", true, "Admin");
+            SessionContext.clear();
+        }
+    }
+
+    @Test
+    @EnabledOnOs(OS.WINDOWS)
+    @DisplayName("R12-P0-02: Windows NTFS Junction 攻擊與 data/tenants 外路徑建立資料庫阻擋")
+    void r12_p0_02_windowsJunctionBlocked() throws Exception {
+        Path outsideDir = Files.createTempDirectory("r12_outside_target_");
+        Path junctionPath = Paths.get(TenantPathResolver.TENANT_ROOT, "r12_evil_junction").toAbsolutePath().normalize();
+        Path tenantJuncDb = Paths.get(TenantPathResolver.resolveDbPath("r12_junc_tenant")).toAbsolutePath().normalize();
+        Files.createDirectories(Paths.get(TenantPathResolver.TENANT_ROOT));
+        Files.deleteIfExists(junctionPath);
+        Files.deleteIfExists(tenantJuncDb);
+        try {
+            Process proc = new ProcessBuilder("cmd.exe", "/c", "mklink", "/J",
+                    junctionPath.toString(), outsideDir.toAbsolutePath().toString())
+                    .redirectErrorStream(true)
+                    .start();
+            int exit = proc.waitFor();
+            String output = new String(proc.getInputStream().readAllBytes());
+            assertEquals(0, exit, "mklink /J 建立測試用 Junction 失敗: " + output);
+
+            Process proc2 = new ProcessBuilder("cmd.exe", "/c", "mklink", "/J",
+                    tenantJuncDb.toString(), outsideDir.toAbsolutePath().toString())
+                    .redirectErrorStream(true)
+                    .start();
+            int exit2 = proc2.waitFor();
+            String output2 = new String(proc2.getInputStream().readAllBytes());
+            assertEquals(0, exit2, "mklink /J 建立租戶 DB Junction 失敗: " + output2);
+
+            // 禁止解析或存取透過 Junction 跳脫至外部目錄的租戶資料庫
+            String evilRel = TenantPathResolver.TENANT_ROOT + "/r12_evil_junction/escape.db";
+            Path evilDb = junctionPath.resolve("escape.db");
+            assertThrows(SecurityException.class, () -> TenantPathResolver.assertSafePath(evilRel),
+                    "必須拒絕經由 Windows Junction 指向外部目錄之相對路徑");
+            assertThrows(SecurityException.class,
+                    () -> TenantPathResolver.resolveDbPath("r12_junc_tenant"),
+                    "TenantPathResolver 不得解析符號連結或 Windows Junction");
+            assertThrows(SecurityException.class,
+                    () -> TenantPathResolver.assertNoSymlinkOrJunction(
+                            evilDb, Paths.get(TenantPathResolver.TENANT_ROOT).toAbsolutePath().normalize()));
+        } finally {
+            Files.deleteIfExists(tenantJuncDb);
+            Files.deleteIfExists(junctionPath);
+            Files.deleteIfExists(outsideDir);
+        }
+    }
+
+    @Test
+    @DisplayName("R12-P0-03: 24 執行緒高並行 Commit/Rollback 隔離與強制關閉租戶連線生命週期")
+    void r12_p0_03_concurrentLeaseStressAndShutdownLifecycle() throws Exception {
+        int threads = 24;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        AtomicInteger commitCount = new AtomicInteger(0);
+        AtomicInteger rollbackCount = new AtomicInteger(0);
+        List<Future<?>> futures = new java.util.ArrayList<>();
+
+        try {
+            for (int i = 0; i < threads; i++) {
+                final int idx = i;
+                final boolean doCommit = (i % 2 == 0);
+                futures.add(pool.submit(() -> {
+                    start.await(5, TimeUnit.SECONDS);
+                    try (Connection c = DbManager.get()) {
+                        c.setAutoCommit(false);
+                        try (PreparedStatement ps = c.prepareStatement(
+                                "INSERT INTO system_meta(meta_key, meta_value) VALUES (?, ?)")) {
+                            ps.setString(1, "stress_" + idx);
+                            ps.setString(2, doCommit ? "committed" : "rolled_back");
+                            ps.executeUpdate();
+                        }
+                        if (doCommit) {
+                            c.commit();
+                            commitCount.incrementAndGet();
+                        } else {
+                            c.rollback();
+                            rollbackCount.incrementAndGet();
+                        }
+                        c.setAutoCommit(true);
+                    }
+                    return null;
+                }));
+            }
+            start.countDown();
+            for (Future<?> f : futures) {
+                f.get(15, TimeUnit.SECONDS);
+            }
+            assertEquals(12, commitCount.get());
+            assertEquals(12, rollbackCount.get());
+
+            try (Connection verify = DbManager.get();
+                 ResultSet rs = verify.createStatement().executeQuery(
+                         "SELECT COUNT(*) FROM system_meta WHERE meta_key LIKE 'stress_%'")) {
+                assertTrue(rs.next());
+                assertEquals(12, rs.getInt(1), "只有 Commit 的 12 筆資料應寫入，Rollback 的 12 筆必須完全隔離");
+            }
+
+            // 驗證強制關閉租戶連線會同步關閉底層實體連線 Proxy 並清空 Lease 追蹤
+            Connection held = DbManager.get();
+            assertFalse(held.isClosed());
+            assertTrue(DbManager.getActiveLeaseCount() >= 1);
+            DbManager.closeCurrent();
+            assertEquals(0, DbManager.getActiveLeaseCount(), "closeCurrent() 後活躍 Lease 數必須為 0");
+            assertTrue(held.isClosed(), "強制關閉後原先持有的 Proxy 連線必須回報 isClosed() == true");
+        } finally {
+            pool.shutdownNow();
+            pool.awaitTermination(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    @DisplayName("R12-P1-01: 累計折舊科目獨立分類、含 1402 處分設備損失情境與可設定科目分類")
+    void r12_p1_01_cashFlowAccumDeprAndCustomClassification() throws Exception {
+        assertEquals(com.ledger.dao.ReportDaoExtra.CashFlowCategory.ACCUM_DEPR_AMORT,
+                com.ledger.dao.ReportDaoExtra.classifyAccount("1402", "ASSET"),
+                "1402 累計折舊必須分類為 ACCUM_DEPR_AMORT，不得混入 INVESTING");
+
+        // 含累計折舊迴轉與處分損失情境
+        voucherService.post(voucherService.createDraft("2027-01-05", "現金增資", "Amy", List.of(
+                entry("1102", "500000.00", "0"),
+                entry("3101", "0", "500000.00")
+        )).id(), "Bob");
+        voucherService.post(voucherService.createDraft("2027-01-10", "購置機器設備", "Amy", List.of(
+                entry("1401", "200000.00", "0"),
+                entry("1102", "0", "200000.00")
+        )).id(), "Bob");
+        voucherService.post(voucherService.createAdjustingDraft("2027-06-30", "折舊費用", "Amy", List.of(
+                entry("5208", "30000.00", "0"),
+                entry("1402", "0", "30000.00")
+        )).id(), "Bob");
+        // 處分設備（成本 130,000、累折 30,000 -> 帳面價值 100,000、現金售價 95,000 -> 處分損失 5,000）
+        voucherService.post(voucherService.createDraft("2027-09-01", "處分設備損失", "Amy", List.of(
+                entry("1102", "95000.00", "0"),
+                entry("1402", "30000.00", "0"),
+                entry("5302", "5000.00", "0"),
+                entry("1401", "0", "130000.00")
+        )).id(), "Bob");
+        // 非現金賒購設備 80,000
+        voucherService.post(voucherService.createDraft("2027-10-01", "賒購設備", "Amy", List.of(
+                entry("1401", "80000.00", "0"),
+                entry("2122", "0", "80000.00")
+        )).id(), "Bob");
+
+        var cf = reportService.getCashFlow("2027-01-01", "2027-12-31");
+        assertTrue(com.ledger.dao.ReportDaoExtra.isCashReconciled(cf), "推算期末現金必須與總帳現金完全勾稽");
+        long cfo = cf.stream().filter(i -> "CFO".equals(i.code())).findFirst().orElseThrow().amountMinor();
+        long cfi = cf.stream().filter(i -> "CFI".equals(i.code())).findFirst().orElseThrow().amountMinor();
+        long cff = cf.stream().filter(i -> "CFF".equals(i.code())).findFirst().orElseThrow().amountMinor();
+        long nonCash = cf.stream().filter(i -> "NON_CASH".equals(i.code())).findFirst().orElseThrow().amountMinor();
+        assertEquals(0L, cfo);
+        assertEquals(MoneyUtil.toMinor("-105000.00"), cfi);
+        assertEquals(MoneyUtil.toMinor("500000.00"), cff);
+        assertEquals(MoneyUtil.toMinor("80000.00"), nonCash);
+
+        // 驗證可設定科目分類覆寫
+        try {
+            com.ledger.dao.ReportDaoExtra.registerAccountClassification(
+                    "1999", com.ledger.dao.ReportDaoExtra.CashFlowCategory.INVESTING);
+            assertEquals(com.ledger.dao.ReportDaoExtra.CashFlowCategory.INVESTING,
+                    com.ledger.dao.ReportDaoExtra.classifyAccount("1999", "ASSET"));
+        } finally {
+            com.ledger.dao.ReportDaoExtra.clearCustomClassifications();
+        }
+    }
+
+    @Test
+    @DisplayName("R12-P1-02: HMAC 金鑰外部隔離儲存、版本輪替（v1->v2）、SQLite 共置防護與路徑邊界檢核")
+    void r12_p1_02_externalKeystoreRotationAndSecurity() throws Exception {
+        Path ksTemp = Files.createTempDirectory("r12_keystore_");
+        Path ksFile = ksTemp.resolve("hmac_keys.properties");
+        String prevProp = System.getProperty("ledger.hmac.keystore.path");
+        System.setProperty("ledger.hmac.keystore.path", ksFile.toString());
+
+        Path src1 = Files.createTempFile("att_v1_", ".txt");
+        Path src2 = Files.createTempFile("att_v2_", ".txt");
+        Path stored1 = null;
+        Path stored2 = null;
+        try {
+            assertTrue(AttachmentService.SIGNATURE_MECHANISM.contains("NOT_PKI"));
+            Voucher v = voucherService.createDraft("2027-04-01", "金鑰測試傳票", "Amy", List.of(
+                    entry("5206", "100.00", "0"),
+                    entry("1101", "0", "100.00")
+            ));
+            voucherService.post(v.id(), "Bob");
+
+            Files.writeString(src1, "VOUCHER-DOC-V1");
+            var a1 = attachmentService.addAttachment(v.id(), src1, "INV-V1", "2027-04-01", "v1", "Amy");
+            stored1 = Paths.get(a1.storedPath());
+            assertEquals("v1", a1.keyVersion());
+            assertTrue(attachmentService.verifyAttachmentSignature(a1.id()));
+
+            // 確認 SQLite system_meta 內沒有 HMAC 金鑰
+            try (Connection conn = DbManager.get();
+                 ResultSet rs = conn.createStatement().executeQuery(
+                         "SELECT COUNT(*) FROM system_meta WHERE meta_key = 'attachment_hmac_key'")) {
+                assertTrue(rs.next());
+                assertEquals(0, rs.getInt(1), "HMAC 金鑰禁止儲存於 SQLite system_meta");
+            }
+
+            // 外部修改 DB 中的 sha256_hash 與磁碟檔案，因缺少外部金鑰仍無法通過驗章
+            String forgedHash = "0".repeat(64);
+            Files.writeString(stored1, "FORGED_CONTENT");
+            try (Connection conn = DbManager.get();
+                 PreparedStatement ps = conn.prepareStatement(
+                         "UPDATE voucher_attachments SET sha256_hash = ? WHERE id = ?")) {
+                ps.setString(1, forgedHash);
+                ps.setLong(2, a1.id());
+                ps.executeUpdate();
+            }
+            assertFalse(attachmentService.verifyAttachmentSignature(a1.id()),
+                    "攻擊者同時竄改 DB 雜湊與檔案內容，無外部金鑰仍必須驗章失敗");
+
+            // 復原 v1 檔案與雜湊，測試金鑰輪替至 v2 後，舊憑證 v1 與新憑證 v2 皆可正確驗證
+            Files.writeString(stored1, "VOUCHER-DOC-V1");
+            try (Connection conn = DbManager.get();
+                 PreparedStatement ps = conn.prepareStatement(
+                         "UPDATE voucher_attachments SET sha256_hash = ? WHERE id = ?")) {
+                ps.setString(1, a1.sha256Hash());
+                ps.setLong(2, a1.id());
+                ps.executeUpdate();
+            }
+            String newVer = attachmentService.rotateHmacKey("Bob");
+            assertEquals("v2", newVer);
+            assertTrue(attachmentService.verifyAttachmentSignature(a1.id()), "金鑰輪替後既有 v1 憑證仍須可驗證");
+
+            Files.writeString(src2, "VOUCHER-DOC-V2");
+            var a2 = attachmentService.addAttachment(v.id(), src2, "INV-V2", "2027-04-02", "v2", "Amy");
+            stored2 = Paths.get(a2.storedPath());
+            assertEquals("v2", a2.keyVersion());
+            assertTrue(attachmentService.verifyAttachmentSignature(a2.id()), "新版 v2 憑證驗章必須通過");
+
+            // 禁止將 keystore 設定在 data/ 目錄內
+            System.setProperty("ledger.hmac.keystore.path", "data/bad_keystore.properties");
+            assertThrows(SecurityException.class, AttachmentService::getExternalKeystorePath);
+        } finally {
+            if (prevProp == null) System.clearProperty("ledger.hmac.keystore.path");
+            else System.setProperty("ledger.hmac.keystore.path", prevProp);
+            Files.deleteIfExists(src1);
+            Files.deleteIfExists(src2);
+            if (stored1 != null) Files.deleteIfExists(stored1);
+            if (stored2 != null) Files.deleteIfExists(stored2);
+            Files.deleteIfExists(ksFile);
+            Files.deleteIfExists(ksTemp);
+        }
+    }
+
+    @Test
+    @DisplayName("R12-P1-03: 商業會計法第38條決算完成日起算、未完結禁銷、批次綁定與防重複核准")
+    void r12_p1_03_legalRetentionAndBatchApproval() {
+        // 尚未登記 2019 年度決算完成日 -> 即使超過 10 年亦不可銷毀
+        assertFalse(retentionService.isEligibleForDestruction("VOUCHER", LocalDate.of(2019, 1, 1), LocalDate.of(2035, 1, 1)),
+                "未完成年度決算程序前，法定保存期間尚未起算");
+        assertThrows(BusinessException.class, () ->
+                retentionService.recordDestructionApproval("BATCH-2019", "VOUCHER", "V-2019-01",
+                        LocalDate.of(2019, 6, 1), LocalDate.of(2035, 1, 1), "未年結", "Bob"));
+
+        // 2018 年度決算完成日為 2019-05-15 -> 憑證 5 年於 2024-05-15 屆滿；帳簿 10 年於 2029-05-15 屆滿
+        retentionService.recordAnnualClosingCompletion(2018, LocalDate.of(2019, 5, 15), "Bob");
+        assertFalse(retentionService.isEligibleForDestruction("VOUCHER", LocalDate.of(2018, 12, 31), LocalDate.of(2024, 5, 14)));
+        assertTrue(retentionService.isEligibleForDestruction("VOUCHER", LocalDate.of(2018, 12, 31), LocalDate.of(2024, 5, 15)));
+        assertFalse(retentionService.isEligibleForDestruction("BOOK", LocalDate.of(2018, 12, 31), LocalDate.of(2029, 5, 14)));
+        assertTrue(retentionService.isEligibleForDestruction("BOOK", LocalDate.of(2018, 12, 31), LocalDate.of(2029, 5, 15)));
+
+        // 空白批次編號不得核准
+        assertThrows(BusinessException.class, () ->
+                retentionService.recordDestructionApproval("  ", "VOUCHER", "V-2018-01",
+                        LocalDate.of(2018, 12, 31), LocalDate.of(2025, 1, 1), "已屆期", "Bob"));
+
+        var rec = retentionService.recordDestructionApproval("DESTROY-BATCH-2025-A", "VOUCHER", "V-2018-ALL",
+                LocalDate.of(2018, 12, 31), LocalDate.of(2025, 1, 1), "2018年度決算後已逾5年", "Bob");
+        assertEquals("DESTROY-BATCH-2025-A", rec.batchId());
+        assertEquals(LocalDate.of(2019, 5, 15), rec.closingCompletionDate());
+
+        // 防範重複核准同一目標
+        assertThrows(BusinessException.class, () ->
+                retentionService.recordDestructionApproval("DESTROY-BATCH-2025-B", "VOUCHER", "V-2018-ALL",
+                        LocalDate.of(2018, 12, 31), LocalDate.of(2025, 2, 1), "重複送簽", "Bob"));
+    }
+
+    @Test
+    @DisplayName("R12-P1-04: 台灣稅務進項不可扣抵、營所稅邊界、擴充扣繳及統一編號／發票邏輯檢核")
+    void r12_p1_04_extendedTaxRulesAndGuiValidation() {
+        assertTrue(TaiwanTaxComplianceService.RULE_EFFECTIVE_DATES.containsKey("CIT_20_PERCENT_AND_THRESHOLD"));
+
+        // 營業稅零稅率、免稅、第 19 條交際應酬不可扣抵與期末應納/留抵試算
+        var zero = taxService.calculateVat(MoneyUtil.toMinor("10000"), TaiwanTaxComplianceService.TaxType.ZERO_RATED, false);
+        assertEquals(0L, zero.vatAmountMinor());
+        assertEquals(TaiwanTaxComplianceService.FilingStatus.INTERNAL_ESTIMATE_ONLY, zero.filingStatus());
+
+        var entVat = taxService.calculateVatInputDeduction(MoneyUtil.toMinor("500"),
+                TaiwanTaxComplianceService.InputVatCategory.NON_DEDUCTIBLE_ENTERTAINMENT);
+        assertEquals(0L, entVat.deductibleVatMinor());
+        assertEquals(MoneyUtil.toMinor("500"), entVat.nonDeductibleVatMinor());
+
+        var periodVat = taxService.calculatePeriodVatPayable(MoneyUtil.toMinor("5000"), MoneyUtil.toMinor("6500"), 0L);
+        assertEquals(0L, periodVat.taxPayableMinor());
+        assertEquals(MoneyUtil.toMinor("1500"), periodVat.nextCarryforwardCreditMinor());
+
+        // 營所稅 12萬 / 20萬邊界與調整後課稅所得（含十年虧損扣抵）
+        assertEquals(MoneyUtil.toMinor("40000"),
+                taxService.calculateCorporateIncomeTax(MoneyUtil.toMinor("200000")).taxPayableMinor());
+        assertEquals(MoneyUtil.toMinor("40000.20"),
+                taxService.calculateCorporateIncomeTax(MoneyUtil.toMinor("200001")).taxPayableMinor());
+        var adjCit = taxService.calculateCorporateIncomeTaxAdjusted(
+                MoneyUtil.toMinor("350000"), MoneyUtil.toMinor("50000"),
+                MoneyUtil.toMinor("100000"), MoneyUtil.toMinor("150000"));
+        assertEquals(MoneyUtil.toMinor("150000"), adjCit.taxableIncomeMinor());
+        assertEquals(MoneyUtil.toMinor("15000"), adjCit.taxPayableMinor());
+
+        // 擴充扣繳類別 + 2,000 元門檻邊界 + 非居住者 10 日內申報旗標
+        assertEquals(0L, taxService.calculateWithholding(MoneyUtil.toMinor("20000"), "ROYALTY", true).taxWithheldMinor());
+        assertEquals(MoneyUtil.toMinor("2001"), taxService.calculateWithholding(MoneyUtil.toMinor("20010"), "ROYALTY", true).taxWithheldMinor());
+        var nonResDiv = taxService.calculateWithholding(MoneyUtil.toMinor("100000"), "DIVIDEND", false);
+        assertEquals(MoneyUtil.toMinor("21000"), nonResDiv.taxWithheldMinor());
+        assertTrue(nonResDiv.requiresFilingImmediately());
+        assertEquals(10, nonResDiv.filingDeadlineDays());
+
+        // 官方 8 碼統一編號檢核碼與雙月期別發票一致性檢核
+        assertTrue(taxService.isValidGuiNumber("22099131"));
+        assertTrue(taxService.isValidGuiNumber("04595257"));
+        assertFalse(taxService.isValidGuiNumber("22099132"));
+        assertTrue(taxService.validateUniformInvoice("AB-12345678", 115, 2,
+                MoneyUtil.toMinor("1000"), MoneyUtil.toMinor("50"), MoneyUtil.toMinor("1050"),
+                TaiwanTaxComplianceService.TaxType.TAXABLE_5_PERCENT).valid());
+        assertFalse(taxService.validateUniformInvoice("AB-12345678", 115, 7,
+                MoneyUtil.toMinor("1000"), MoneyUtil.toMinor("50"), MoneyUtil.toMinor("1050"),
+                TaiwanTaxComplianceService.TaxType.TAXABLE_5_PERCENT).valid());
     }
 }

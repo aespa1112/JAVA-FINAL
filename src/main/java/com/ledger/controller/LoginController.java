@@ -41,7 +41,6 @@ public class LoginController {
                 }
             }
 
-            SessionContext.setUser(canonical, display);
             Stage stage = (Stage) usernameField.getScene().getWindow();
 
             if (authService.isAdmin(canonical)) {

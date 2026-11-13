@@ -699,7 +699,7 @@ public class LedgerSystemTest {
     void testT25_OperatorWhitelistAndSpoofingProtection() throws SQLException {
         assertThrows(BusinessException.class, () -> com.ledger.model.OperatorRole.normalize("Zed"));
         assertThrows(BusinessException.class, () -> com.ledger.model.OperatorRole.normalize(""));
-        SessionContext.setUser("Amy", "Amy");
+        new com.ledger.service.AuthService().login("amy", "amy123");
         assertThrows(BusinessException.class, () -> SessionContext.resolveOperator("Bob"));
         SessionContext.clear();
         SessionContext.clear();
@@ -861,7 +861,7 @@ public class LedgerSystemTest {
     @DisplayName("R4-P0-03: Session 身分不可偽造")
     void testR4_SessionRejectsSpoofedOperator() {
         SessionContext.clear();
-        SessionContext.setUser("Amy", "Amy");
+        new com.ledger.service.AuthService().login("amy", "amy123");
         assertThrows(BusinessException.class, () ->
                 SessionContext.resolveOperator("Bob"));
         assertEquals("Amy", SessionContext.resolveOperator("Amy"));

@@ -2,15 +2,25 @@ package com.ledger.service;
 
 import com.ledger.config.DbManager;
 import com.ledger.config.SessionContext;
+import com.ledger.config.TenantPathResolver;
 import com.ledger.dao.AuditDao;
 import com.ledger.exception.BusinessException;
 import com.ledger.model.OperatorRole;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.AclEntry;
+import java.nio.file.attribute.AclEntryPermission;
+import java.nio.file.attribute.AclEntryType;
+import java.nio.file.attribute.AclFileAttributeView;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.UserPrincipal;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.sql.*;
@@ -18,20 +28,31 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.EnumSet;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Properties;
+import java.util.Set;
 import javax.crypto.Mac;
 import javax.crypto.spec.SecretKeySpec;
 
 /**
- * 原始憑證附件正式保存與電子簽章授權管理（依據商業會計法及電子處理辦法）。
+ * 原始憑證附件正式保存與內部完整性驗證（依據商業會計法及電子處理辦法）。
  * <p>
- * 功能：
- * - 原始憑證關聯記帳傳票、紀錄憑證字號/日期、SHA-256 雜湊與 HMAC-SHA256 電子簽章
- * - 驗章（verifyAttachmentSignature）防範檔案竄改
- * - 已過帳傳票之原始憑證禁止直接刪除；支援核准作廢歷程（status='VOID'）並保留完整審計軌跡
+ * 功能與安全設計：
+ * - 原始憑證關聯記帳傳票、紀錄憑證字號/日期與 SHA-256 雜湊。
+ * - 使用對稱式 HMAC-SHA256 進行內部完整性／來源防偽驗證（注意：HMAC 為對稱金鑰驗證碼，
+ *   非 X.509 / PKI 非對稱公開金鑰數位簽章，不具對外第三方憑證機構不可否認性）。
+ * - 金鑰存放於資料庫與附件目錄之外的 OS 受保護安全儲存檔（預設 {@code ~/.ledger_security/attachment_hmac_keys.properties}，
+ *   可透過系統屬性 {@code -Dledger.hmac.keystore.path} 指定，禁止置於 {@code data/} 或 {@code attachments/}）。
+ * - 支援金鑰版本控管（{@code key_version}）與安全輪替（{@link #rotateHmacKey(String)}）。
+ * - 嚴格驗證附件存取路徑邊界（防止路徑穿越與符號連結／Junction 攻擊）。
  */
 public class AttachmentService {
+
+    public static final String SIGNATURE_MECHANISM = "SYMMETRIC_HMAC_SHA256_INTERNAL_INTEGRITY_NOT_PKI";
+    private static final String KEYSTORE_SYS_PROP = "ledger.hmac.keystore.path";
+    private static final Object KEYSTORE_LOCK = new Object();
 
     public record Attachment(
             long id,
@@ -50,12 +71,21 @@ public class AttachmentService {
             String status,
             String voidReason,
             String voidedBy,
-            String voidedAt
+            String voidedAt,
+            String keyVersion
     ) {
         public Attachment(long id, long voucherId, String fileName, String storedPath,
                           String contentType, long fileSize, String uploadedBy, String uploadedAt, String remark) {
             this(id, voucherId, fileName, storedPath, contentType, fileSize, uploadedBy, uploadedAt, remark,
-                    null, null, null, null, "ACTIVE", null, null, null);
+                    null, null, null, null, "ACTIVE", null, null, null, "v1");
+        }
+
+        public Attachment(long id, long voucherId, String fileName, String storedPath,
+                          String contentType, long fileSize, String uploadedBy, String uploadedAt, String remark,
+                          String docNo, String docDate, String sha256Hash, String digitalSignature,
+                          String status, String voidReason, String voidedBy, String voidedAt) {
+            this(id, voucherId, fileName, storedPath, contentType, fileSize, uploadedBy, uploadedAt, remark,
+                    docNo, docDate, sha256Hash, digitalSignature, status, voidReason, voidedBy, voidedAt, "v1");
         }
     }
 
@@ -78,6 +108,7 @@ public class AttachmentService {
                 "doc_date TEXT, " +
                 "sha256_hash TEXT, " +
                 "digital_signature TEXT, " +
+                "key_version TEXT NOT NULL DEFAULT 'v1', " +
                 "status TEXT NOT NULL DEFAULT 'ACTIVE', " +
                 "void_reason TEXT, " +
                 "voided_by TEXT, " +
@@ -90,10 +121,12 @@ public class AttachmentService {
         ensureAttachmentColumn(conn, "doc_date", "TEXT");
         ensureAttachmentColumn(conn, "sha256_hash", "TEXT");
         ensureAttachmentColumn(conn, "digital_signature", "TEXT");
+        ensureAttachmentColumn(conn, "key_version", "TEXT NOT NULL DEFAULT 'v1'");
         ensureAttachmentColumn(conn, "status", "TEXT NOT NULL DEFAULT 'ACTIVE'");
         ensureAttachmentColumn(conn, "void_reason", "TEXT");
         ensureAttachmentColumn(conn, "voided_by", "TEXT");
         ensureAttachmentColumn(conn, "voided_at", "TEXT");
+        purgeLegacyDbHmacKey(conn);
     }
 
     private static void ensureAttachmentColumn(Connection conn, String colName, String colDef) throws SQLException {
@@ -124,8 +157,10 @@ public class AttachmentService {
         if (role == OperatorRole.ADMIN) {
             throw new BusinessException("管理員不可操作會計傳票附件");
         }
-        if (sourceFile == null || !Files.exists(sourceFile) || !Files.isRegularFile(sourceFile)) {
-            throw new BusinessException("附件檔案不存在");
+        if (sourceFile == null || Files.isSymbolicLink(sourceFile)
+                || !Files.exists(sourceFile, LinkOption.NOFOLLOW_LINKS)
+                || !Files.isRegularFile(sourceFile, LinkOption.NOFOLLOW_LINKS)) {
+            throw new BusinessException("附件檔案不存在或為不安全之符號連結");
         }
         String normDocNo = (docNo == null || docNo.isBlank()) ? "DOC-" + voucherId : docNo.trim();
         String normDocDate = (docDate == null || docDate.isBlank()) ? LocalDate.now().toString() : docDate.trim();
@@ -147,36 +182,44 @@ public class AttachmentService {
                 }
             }
 
-            String dbNamePart = DbManager.getCurrentTenant();
+            String dbNamePart = sanitizePathSegment(DbManager.getCurrentTenant());
             if (dbNamePart == null || dbNamePart.isBlank()) {
-                dbNamePart = Paths.get(DbManager.getCurrentDbPath()).getFileName().toString().replace(".db", "");
+                dbNamePart = sanitizePathSegment(
+                        Paths.get(DbManager.getCurrentDbPath()).getFileName().toString().replace(".db", ""));
             }
-            Path dir = Paths.get("attachments", dbNamePart, String.valueOf(voucherId));
+            Path attachmentsRoot = getAttachmentsRoot();
+            Path dir = attachmentsRoot.resolve(dbNamePart).resolve(String.valueOf(voucherId)).normalize();
+            TenantPathResolver.assertNoSymlinkOrJunction(dir, attachmentsRoot);
             Files.createDirectories(dir);
+            TenantPathResolver.assertNoSymlinkOrJunction(dir, attachmentsRoot);
 
-            String originalName = sourceFile.getFileName().toString();
+            String originalName = sanitizeFilename(sourceFile.getFileName().toString());
             String stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss_SSS"));
             String storedName = stamp + "_" + originalName;
-            Path target = dir.resolve(storedName);
+            Path target = dir.resolve(storedName).normalize();
+            TenantPathResolver.assertNoSymlinkOrJunction(target, attachmentsRoot);
             Files.copy(sourceFile, target, StandardCopyOption.REPLACE_EXISTING);
 
             byte[] content = Files.readAllBytes(target);
             long size = content.length;
             String contentType = guessContentType(originalName);
             String sha256 = sha256Hex(content);
-            String hmacKey = getOrCreateHmacKey(conn);
-            String signature = signPayload(hmacKey, voucherId, normDocNo, normDocDate, sha256, normOp);
+            VersionedKey activeKey = getActiveSigningKey();
+            String keyVersion = activeKey.version();
+            String signature = signPayload(activeKey.hexKey(), keyVersion, voucherId, normDocNo, normDocDate, sha256, normOp);
             String uploadedAt = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+            String relativeStored = Paths.get("attachments", dbNamePart, String.valueOf(voucherId), storedName)
+                    .toString().replace('\\', '/');
 
             String sql = "INSERT INTO voucher_attachments " +
                     "(voucher_id, file_name, stored_path, content_type, file_size, uploaded_by, uploaded_at, remark, " +
-                    "doc_no, doc_date, sha256_hash, digital_signature, status) " +
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'ACTIVE')";
+                    "doc_no, doc_date, sha256_hash, digital_signature, key_version, status) " +
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'ACTIVE')";
             long id;
             try (PreparedStatement ps = conn.prepareStatement(sql, Statement.RETURN_GENERATED_KEYS)) {
                 ps.setLong(1, voucherId);
                 ps.setString(2, originalName);
-                ps.setString(3, target.toString().replace('\\', '/'));
+                ps.setString(3, relativeStored);
                 ps.setString(4, contentType);
                 ps.setLong(5, size);
                 ps.setString(6, normOp);
@@ -186,6 +229,7 @@ public class AttachmentService {
                 ps.setString(10, normDocDate);
                 ps.setString(11, sha256);
                 ps.setString(12, signature);
+                ps.setString(13, keyVersion);
                 ps.executeUpdate();
                 try (ResultSet keys = ps.getGeneratedKeys()) {
                     id = keys.next() ? keys.getLong(1) : 0;
@@ -193,10 +237,10 @@ public class AttachmentService {
             }
             auditDao.log(conn, "ATTACH_ADD", "voucher_attachments", id, normOp,
                     null, "voucherId=" + voucherId + "; docNo=" + normDocNo + "; docDate=" + normDocDate
-                            + "; file=" + originalName + "; sha256=" + sha256);
-            return new Attachment(id, voucherId, originalName, target.toString().replace('\\', '/'),
+                            + "; keyVersion=" + keyVersion + "; file=" + originalName + "; sha256=" + sha256);
+            return new Attachment(id, voucherId, originalName, relativeStored,
                     contentType, size, normOp, uploadedAt, remark,
-                    normDocNo, normDocDate, sha256, signature, "ACTIVE", null, null, null);
+                    normDocNo, normDocDate, sha256, signature, "ACTIVE", null, null, null, keyVersion);
         } catch (BusinessException e) {
             throw e;
         } catch (Exception e) {
@@ -207,7 +251,8 @@ public class AttachmentService {
     public boolean verifyAttachmentSignature(long attachmentId) {
         try (Connection conn = DbManager.get()) {
             ensureTable(conn);
-            String sql = "SELECT voucher_id, stored_path, uploaded_by, doc_no, doc_date, sha256_hash, digital_signature " +
+            String sql = "SELECT voucher_id, stored_path, uploaded_by, doc_no, doc_date, sha256_hash, digital_signature, " +
+                    "COALESCE(key_version, 'v1') AS key_version " +
                     "FROM voucher_attachments WHERE id = ?";
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setLong(1, attachmentId);
@@ -220,13 +265,24 @@ public class AttachmentService {
                     String docDate = rs.getString("doc_date");
                     String expectedHash = rs.getString("sha256_hash");
                     String expectedSig = rs.getString("digital_signature");
+                    String keyVersion = rs.getString("key_version");
                     if (storedPath == null || expectedHash == null || expectedSig == null) return false;
-                    Path p = Paths.get(storedPath);
-                    if (!Files.exists(p) || !Files.isRegularFile(p)) return false;
+
+                    Path attachmentsRoot = getAttachmentsRoot();
+                    Path p = Paths.get(storedPath).toAbsolutePath().normalize();
+                    TenantPathResolver.assertNoSymlinkOrJunction(p, attachmentsRoot);
+                    if (!Files.exists(p, LinkOption.NOFOLLOW_LINKS)
+                            || !Files.isRegularFile(p, LinkOption.NOFOLLOW_LINKS)) {
+                        return false;
+                    }
+
                     String actualHash = sha256Hex(Files.readAllBytes(p));
                     if (!expectedHash.equalsIgnoreCase(actualHash)) return false;
-                    String hmacKey = getOrCreateHmacKey(conn);
-                    String actualSig = signPayload(hmacKey, voucherId, docNo, docDate, actualHash, uploadedBy);
+
+                    String hexKey = getHmacKeyForVersion(keyVersion);
+                    if (hexKey == null) return false;
+
+                    String actualSig = signPayload(hexKey, keyVersion, voucherId, docNo, docDate, actualHash, uploadedBy);
                     return MessageDigest.isEqual(
                             expectedSig.getBytes(StandardCharsets.UTF_8),
                             actualSig.getBytes(StandardCharsets.UTF_8));
@@ -243,7 +299,7 @@ public class AttachmentService {
             ensureTable(conn);
             String sql = "SELECT id, voucher_id, file_name, stored_path, content_type, file_size, " +
                     "uploaded_by, uploaded_at, remark, doc_no, doc_date, sha256_hash, digital_signature, " +
-                    "status, void_reason, voided_by, voided_at " +
+                    "status, void_reason, voided_by, voided_at, COALESCE(key_version, 'v1') AS key_version " +
                     "FROM voucher_attachments WHERE voucher_id = ? ORDER BY id";
             try (PreparedStatement ps = conn.prepareStatement(sql)) {
                 ps.setLong(1, voucherId);
@@ -266,7 +322,8 @@ public class AttachmentService {
                                 rs.getString("status"),
                                 rs.getString("void_reason"),
                                 rs.getString("voided_by"),
-                                rs.getString("voided_at")
+                                rs.getString("voided_at"),
+                                rs.getString("key_version")
                         ));
                     }
                 }
@@ -367,7 +424,12 @@ public class AttachmentService {
             auditDao.log(conn, "ATTACH_DELETE", "voucher_attachments", attachmentId, normOp,
                     "voucherId=" + voucherId + "; file=" + fileName, "DELETED");
             if (path != null) {
-                try { Files.deleteIfExists(Paths.get(path)); } catch (IOException ignored) {}
+                try {
+                    Path attachmentsRoot = getAttachmentsRoot();
+                    Path resolved = Paths.get(path).toAbsolutePath().normalize();
+                    TenantPathResolver.assertNoSymlinkOrJunction(resolved, attachmentsRoot);
+                    Files.deleteIfExists(resolved);
+                } catch (Exception ignored) {}
             }
         } catch (BusinessException e) {
             throw e;
@@ -376,40 +438,238 @@ public class AttachmentService {
         }
     }
 
+    /**
+     * 輪替外部 HMAC 金鑰（產生新版本 v2/v3...），保留舊版金鑰供既有憑證驗章，新上傳憑證將使用新版本金鑰。
+     */
+    public String rotateHmacKey(String operator) {
+        String normOp = SessionContext.resolveOperator(operator);
+        OperatorRole role = OperatorRole.resolve(normOp);
+        if (role != OperatorRole.CHECKER && role != OperatorRole.ADMIN) {
+            throw new BusinessException("權限不足：僅會計師（CHECKER）或系統管理員可輪替憑證 HMAC 金鑰");
+        }
+        String newVersion;
+        synchronized (KEYSTORE_LOCK) {
+            Path ksPath = getKeystorePath();
+            Properties props = loadOrInitKeystore(ksPath);
+            String currentVer = props.getProperty("active_version", "v1");
+            int nextNum = parseVersionNumber(currentVer) + 1;
+            newVersion = "v" + nextNum;
+            props.setProperty("key." + newVersion, generateRandomHexKey());
+            props.setProperty("active_version", newVersion);
+            saveKeystore(ksPath, props);
+        }
+        try (Connection conn = DbManager.get()) {
+            ensureTable(conn);
+            auditDao.log(conn, "HMAC_KEY_ROTATE", "attachment_hmac_keystore", null, normOp,
+                    null, "newVersion=" + newVersion + "; mechanism=" + SIGNATURE_MECHANISM);
+        } catch (SQLException ignored) {
+            // Best-effort audit when called outside active tenant
+        }
+        return newVersion;
+    }
+
+    /**
+     * 取得目前啟用中的金鑰版本。
+     */
+    public static String getCurrentKeyVersion() {
+        synchronized (KEYSTORE_LOCK) {
+            Properties props = loadOrInitKeystore(getKeystorePath());
+            return props.getProperty("active_version", "v1");
+        }
+    }
+
+    /**
+     * 取得目前外部金鑰儲存檔路徑（可供稽核與測試確認未與 SQLite 資料檔存放於同處）。
+     */
+    public static Path getExternalKeystorePath() {
+        return getKeystorePath();
+    }
+
+    private record VersionedKey(String version, String hexKey) {}
+
+    private static VersionedKey getActiveSigningKey() {
+        synchronized (KEYSTORE_LOCK) {
+            Path ksPath = getKeystorePath();
+            Properties props = loadOrInitKeystore(ksPath);
+            String ver = props.getProperty("active_version", "v1");
+            String hex = props.getProperty("key." + ver);
+            if (hex == null || hex.isBlank()) {
+                hex = generateRandomHexKey();
+                props.setProperty("key." + ver, hex);
+                saveKeystore(ksPath, props);
+            }
+            return new VersionedKey(ver, hex);
+        }
+    }
+
+    private static String getHmacKeyForVersion(String version) {
+        String ver = (version == null || version.isBlank()) ? "v1" : version.trim();
+        synchronized (KEYSTORE_LOCK) {
+            Path ksPath = getKeystorePath();
+            if (!Files.exists(ksPath, LinkOption.NOFOLLOW_LINKS)) {
+                return null;
+            }
+            Properties props = loadKeystoreOnly(ksPath);
+            String val = props.getProperty("key." + ver);
+            return (val == null || val.isBlank()) ? null : val.trim();
+        }
+    }
+
+    private static Path getKeystorePath() {
+        String configured = System.getProperty(KEYSTORE_SYS_PROP);
+        Path candidate;
+        if (configured != null && !configured.isBlank()) {
+            candidate = Paths.get(configured.trim()).toAbsolutePath().normalize();
+        } else {
+            String home = System.getProperty("user.home", ".");
+            candidate = Paths.get(home, ".ledger_security", "attachment_hmac_keys.properties")
+                    .toAbsolutePath().normalize();
+        }
+        Path dataDir = Paths.get("data").toAbsolutePath().normalize();
+        Path attachDir = getAttachmentsRoot();
+        if (candidate.startsWith(dataDir) || candidate.startsWith(attachDir)) {
+            throw new SecurityException("HMAC 金鑰儲存位置禁止與資料庫（data/）或附件目錄（attachments/）共置: " + candidate);
+        }
+        return candidate;
+    }
+
+    private static Properties loadOrInitKeystore(Path ksPath) {
+        if (Files.isSymbolicLink(ksPath)) {
+            throw new SecurityException("安全異常：HMAC 金鑰檔不得為符號連結: " + ksPath);
+        }
+        Properties props = Files.exists(ksPath, LinkOption.NOFOLLOW_LINKS)
+                ? loadKeystoreOnly(ksPath)
+                : new Properties();
+        if (!props.containsKey("active_version") || !props.containsKey("key." + props.getProperty("active_version"))) {
+            String ver = props.getProperty("active_version", "v1");
+            props.setProperty("active_version", ver);
+            props.setProperty("key." + ver, generateRandomHexKey());
+            saveKeystore(ksPath, props);
+        }
+        return props;
+    }
+
+    private static Properties loadKeystoreOnly(Path ksPath) {
+        if (Files.isSymbolicLink(ksPath)) {
+            throw new SecurityException("安全異常：HMAC 金鑰檔不得為符號連結: " + ksPath);
+        }
+        Properties props = new Properties();
+        try (InputStream in = Files.newInputStream(ksPath, LinkOption.NOFOLLOW_LINKS)) {
+            props.load(in);
+        } catch (IOException e) {
+            throw new BusinessException("讀取外部 HMAC 金鑰儲存失敗: " + e.getMessage(), e);
+        }
+        return props;
+    }
+
+    private static void saveKeystore(Path ksPath, Properties props) {
+        try {
+            Path parent = ksPath.getParent();
+            if (parent != null && !Files.exists(parent, LinkOption.NOFOLLOW_LINKS)) {
+                Files.createDirectories(parent);
+                hardenFilePermissions(parent, true);
+            }
+            if (Files.isSymbolicLink(ksPath)) {
+                throw new SecurityException("安全異常：HMAC 金鑰檔不得為符號連結");
+            }
+            try (OutputStream out = Files.newOutputStream(ksPath)) {
+                props.store(out, "JAVA-FINAL External Attachment HMAC Keystore (DO NOT STORE IN SQLITE)");
+            }
+            hardenFilePermissions(ksPath, false);
+        } catch (IOException e) {
+            throw new BusinessException("寫入外部 HMAC 金鑰儲存失敗: " + e.getMessage(), e);
+        }
+    }
+
+    private static void hardenFilePermissions(Path path, boolean isDir) {
+        try {
+            var posix = Files.getFileAttributeView(path, java.nio.file.attribute.PosixFileAttributeView.class);
+            if (posix != null) {
+                Set<PosixFilePermission> perms = isDir
+                        ? EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE)
+                        : EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE);
+                Files.setPosixFilePermissions(path, perms);
+                return;
+            }
+            AclFileAttributeView aclView = Files.getFileAttributeView(path, AclFileAttributeView.class);
+            if (aclView != null) {
+                UserPrincipal owner = aclView.getOwner();
+                AclEntry entry = AclEntry.newBuilder()
+                        .setType(AclEntryType.ALLOW)
+                        .setPrincipal(owner)
+                        .setPermissions(EnumSet.allOf(AclEntryPermission.class))
+                        .build();
+                aclView.setAcl(List.of(entry));
+            }
+        } catch (Exception ignored) {
+            // Fallback best-effort when running on restricted virtual filesystems
+        }
+    }
+
+    private static void purgeLegacyDbHmacKey(Connection conn) {
+        try {
+            DbManager.ensureSystemTables(conn);
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "DELETE FROM system_meta WHERE meta_key = 'attachment_hmac_key'")) {
+                ps.executeUpdate();
+            }
+        } catch (SQLException ignored) {
+        }
+    }
+
+    private static Path getAttachmentsRoot() {
+        Path root = Paths.get("attachments").toAbsolutePath().normalize();
+        if (Files.isSymbolicLink(root)) {
+            throw new SecurityException("安全異常：attachments 根目錄不得為符號連結");
+        }
+        return root;
+    }
+
+    private static String sanitizePathSegment(String value) {
+        if (value == null || value.isBlank()) return "";
+        String trimmed = value.trim();
+        if (trimmed.contains("..") || trimmed.contains("/") || trimmed.contains("\\") || trimmed.indexOf('\0') >= 0) {
+            throw new SecurityException("非法附件目錄名稱: " + value);
+        }
+        return trimmed;
+    }
+
+    private static String sanitizeFilename(String name) {
+        if (name == null || name.isBlank()) {
+            throw new BusinessException("附件檔名不可為空");
+        }
+        String trimmed = name.trim();
+        if (trimmed.contains("..") || trimmed.contains("/") || trimmed.contains("\\") || trimmed.indexOf('\0') >= 0) {
+            throw new SecurityException("非法附件檔名（疑似路徑穿越）: " + name);
+        }
+        return trimmed;
+    }
+
+    private static int parseVersionNumber(String version) {
+        if (version != null && version.startsWith("v")) {
+            try {
+                return Integer.parseInt(version.substring(1));
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return 1;
+    }
+
+    private static String generateRandomHexKey() {
+        byte[] keyBytes = new byte[32];
+        new SecureRandom().nextBytes(keyBytes);
+        return HexFormat.of().formatHex(keyBytes);
+    }
+
     private static String sha256Hex(byte[] data) throws Exception {
         MessageDigest md = MessageDigest.getInstance("SHA-256");
         return HexFormat.of().formatHex(md.digest(data));
     }
 
-    private static String getOrCreateHmacKey(Connection conn) throws SQLException {
-        DbManager.ensureSystemTables(conn);
-        try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT meta_value FROM system_meta WHERE meta_key = 'attachment_hmac_key'")) {
-            try (ResultSet rs = ps.executeQuery()) {
-                if (rs.next()) {
-                    String val = rs.getString(1);
-                    if (val != null && !val.isBlank()) return val;
-                }
-            }
-        }
-        byte[] keyBytes = new byte[32];
-        new SecureRandom().nextBytes(keyBytes);
-        String hex = HexFormat.of().formatHex(keyBytes);
-        try (PreparedStatement ps = conn.prepareStatement(
-                "INSERT OR IGNORE INTO system_meta (meta_key, meta_value) VALUES ('attachment_hmac_key', ?)")) {
-            ps.setString(1, hex);
-            ps.executeUpdate();
-        }
-        try (PreparedStatement ps = conn.prepareStatement(
-                "SELECT meta_value FROM system_meta WHERE meta_key = 'attachment_hmac_key'");
-             ResultSet rs = ps.executeQuery()) {
-            return rs.next() ? rs.getString(1) : hex;
-        }
-    }
-
-    private static String signPayload(String hexKey, long voucherId, String docNo, String docDate,
+    private static String signPayload(String hexKey, String keyVersion, long voucherId, String docNo, String docDate,
                                       String sha256, String operator) throws Exception {
-        String payload = voucherId + "|" + (docNo != null ? docNo : "") + "|"
+        String payload = (keyVersion != null ? keyVersion : "v1") + "|"
+                + voucherId + "|" + (docNo != null ? docNo : "") + "|"
                 + (docDate != null ? docDate : "") + "|" + sha256 + "|" + (operator != null ? operator : "");
         Mac mac = Mac.getInstance("HmacSHA256");
         mac.init(new SecretKeySpec(HexFormat.of().parseHex(hexKey), "HmacSHA256"));

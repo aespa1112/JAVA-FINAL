@@ -6,6 +6,7 @@ import java.io.InputStreamReader;
 import java.lang.reflect.Proxy;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.Connection;
@@ -52,8 +53,38 @@ public final class DbManager {
             "PRAGMA cache_size = -8000;"
     };
 
+    private static final class LeaseHolder {
+        final Connection raw;
+        final String normKey;
+        final AtomicBoolean closed = new AtomicBoolean(false);
+        final Object opLock = new Object();
+
+        LeaseHolder(Connection raw, String normKey) {
+            this.raw = raw;
+            this.normKey = normKey;
+        }
+
+        void closeLease() {
+            synchronized (opLock) {
+                if (closed.compareAndSet(false, true)) {
+                    closeUnderlyingQuietly(raw);
+                }
+            }
+        }
+
+        boolean isClosed() {
+            synchronized (opLock) {
+                try {
+                    return closed.get() || raw == null || raw.isClosed();
+                } catch (SQLException e) {
+                    return true;
+                }
+            }
+        }
+    }
+
     private static volatile String currentDbPath = "data/client_A.db";
-    private static final Map<String, Set<Connection>> activeLeases = new ConcurrentHashMap<>();
+    private static final Map<String, Set<LeaseHolder>> activeLeases = new ConcurrentHashMap<>();
     private static final Map<String, Object> pathLocks = new ConcurrentHashMap<>();
     private static final ThreadLocal<String> currentTenant = new ThreadLocal<>();
 
@@ -124,11 +155,34 @@ public final class DbManager {
     private static Connection leaseConnection(String dbPath) throws SQLException {
         String normKey = normalizePathKey(dbPath);
         Object lock = pathLocks.computeIfAbsent(normKey, k -> new Object());
-        Connection raw;
         synchronized (lock) {
-            raw = createRawConnection(dbPath);
+            Connection raw = createRawConnection(dbPath);
+            return wrapLeasedConnection(raw, normKey);
         }
-        return wrapLeasedConnection(raw, normKey);
+    }
+
+    public static int getActiveLeaseCount() {
+        int total = 0;
+        for (Set<LeaseHolder> set : activeLeases.values()) {
+            if (set != null) {
+                for (LeaseHolder h : set) {
+                    if (!h.isClosed()) total++;
+                }
+            }
+        }
+        return total;
+    }
+
+    public static int getActiveLeaseCountForTenant(String tenantId) {
+        if (tenantId == null || tenantId.isBlank()) return 0;
+        String dbPath = TenantPathResolver.resolveDbPath(tenantId);
+        Set<LeaseHolder> set = activeLeases.get(normalizePathKey(dbPath));
+        if (set == null) return 0;
+        int count = 0;
+        for (LeaseHolder h : set) {
+            if (!h.isClosed()) count++;
+        }
+        return count;
     }
 
     @Deprecated
@@ -171,10 +225,16 @@ public final class DbManager {
 
     private static void closeAllLeasesForPath(String dbPath) {
         String normKey = normalizePathKey(dbPath);
-        Set<Connection> set = activeLeases.remove(normKey);
-        if (set == null) return;
-        for (Connection conn : new ArrayList<>(set)) {
-            closeUnderlyingQuietly(conn);
+        Object lock = pathLocks.computeIfAbsent(normKey, k -> new Object());
+        List<LeaseHolder> holders;
+        synchronized (lock) {
+            Set<LeaseHolder> set = activeLeases.remove(normKey);
+            if (set == null || set.isEmpty()) return;
+            holders = new ArrayList<>(set);
+            set.clear();
+        }
+        for (LeaseHolder h : holders) {
+            h.closeLease();
         }
     }
 
@@ -230,14 +290,31 @@ public final class DbManager {
 
     static Connection createRawConnection(String dbPath) throws SQLException {
         boolean isMemory = ":memory:".equalsIgnoreCase(dbPath);
+        Path path = null;
+        Path allowedRoot = null;
+        Path preReal = null;
         if (!isMemory) {
-            Path path = Paths.get(dbPath);
+            TenantPathResolver.assertSafePath(dbPath);
+            String norm = normalizePathKey(dbPath);
+            allowedRoot = norm.startsWith(TenantPathResolver.TENANT_ROOT + "/")
+                    ? Paths.get(TenantPathResolver.TENANT_ROOT)
+                    : Paths.get("data");
+            path = Paths.get(dbPath);
+            TenantPathResolver.assertNoSymlinkOrJunction(path, allowedRoot);
             Path parent = path.getParent();
-            if (parent != null && !Files.exists(parent)) {
+            if (parent != null && !Files.exists(parent, LinkOption.NOFOLLOW_LINKS)) {
                 try {
                     Files.createDirectories(parent);
                 } catch (Exception e) {
                     throw new SQLException("無法建立資料庫目錄: " + parent, e);
+                }
+            }
+            TenantPathResolver.assertNoSymlinkOrJunction(path, allowedRoot);
+            if (Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
+                try {
+                    preReal = path.toRealPath(LinkOption.NOFOLLOW_LINKS);
+                } catch (Exception e) {
+                    throw new SecurityException("無法驗證資料庫實體路徑: " + dbPath, e);
                 }
             }
         }
@@ -245,6 +322,17 @@ public final class DbManager {
         String url = "jdbc:sqlite:" + dbPath;
         Connection conn = DriverManager.getConnection(url);
         try {
+            if (!isMemory) {
+                TenantPathResolver.assertNoSymlinkOrJunction(path, allowedRoot);
+                Path postReal = path.toRealPath(LinkOption.NOFOLLOW_LINKS);
+                Path rootReal = allowedRoot.toRealPath();
+                if (!postReal.startsWith(rootReal)) {
+                    throw new SecurityException("TOCTOU validation failed: DB path escaped root: " + postReal);
+                }
+                if (preReal != null && !preReal.equals(postReal)) {
+                    throw new SecurityException("TOCTOU race detected on database path: " + dbPath);
+                }
+            }
             applyPragmas(conn);
             migrateSchema(conn, dbPath);
             return conn;
@@ -254,18 +342,21 @@ public final class DbManager {
             } catch (SQLException ignored) {
             }
             throw e;
-        } catch (RuntimeException | Error e) {
+        } catch (Exception | Error e) {
             try {
                 conn.close();
             } catch (SQLException ignored) {
             }
-            throw e;
+            if (e instanceof SecurityException se) throw se;
+            if (e instanceof RuntimeException re) throw re;
+            if (e instanceof Error err) throw err;
+            throw new SQLException(e);
         }
     }
 
     private static Connection wrapLeasedConnection(Connection realConnection, String normKey) {
-        activeLeases.computeIfAbsent(normKey, k -> ConcurrentHashMap.newKeySet()).add(realConnection);
-        AtomicBoolean closed = new AtomicBoolean(false);
+        LeaseHolder holder = new LeaseHolder(realConnection, normKey);
+        activeLeases.computeIfAbsent(normKey, k -> ConcurrentHashMap.newKeySet()).add(holder);
         return (Connection) Proxy.newProxyInstance(
                 Connection.class.getClassLoader(),
                 new Class<?>[]{Connection.class},
@@ -278,31 +369,31 @@ public final class DbManager {
                         return System.identityHashCode(proxy);
                     }
                     if ("toString".equals(name)) {
-                        return "LeasedConnection[" + normKey + ", closed=" + closed.get() + "]";
+                        return "LeasedConnection[" + normKey + ", closed=" + holder.isClosed() + "]";
                     }
                     if ("close".equals(name)) {
-                        if (closed.compareAndSet(false, true)) {
-                            Set<Connection> set = activeLeases.get(normKey);
-                            if (set != null) {
-                                set.remove(realConnection);
-                            }
-                            closeUnderlyingQuietly(realConnection);
+                        Set<LeaseHolder> set = activeLeases.get(normKey);
+                        if (set != null) {
+                            set.remove(holder);
                         }
+                        holder.closeLease();
                         return null;
                     }
                     if ("isClosed".equals(name)) {
-                        return closed.get() || realConnection.isClosed();
+                        return holder.isClosed();
                     }
-                    if ("isValid".equals(name) && closed.get()) {
+                    if ("isValid".equals(name) && holder.isClosed()) {
                         return false;
                     }
-                    if (closed.get()) {
-                        throw new SQLException("Connection lease is already closed");
-                    }
-                    try {
-                        return method.invoke(realConnection, args);
-                    } catch (java.lang.reflect.InvocationTargetException e) {
-                        throw e.getCause();
+                    synchronized (holder.opLock) {
+                        if (holder.isClosed()) {
+                            throw new SQLException("Connection lease is already closed");
+                        }
+                        try {
+                            return method.invoke(realConnection, args);
+                        } catch (java.lang.reflect.InvocationTargetException e) {
+                            throw e.getCause();
+                        }
                     }
                 }
         );

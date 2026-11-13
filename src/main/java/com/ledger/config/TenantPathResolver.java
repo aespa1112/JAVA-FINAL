@@ -1,8 +1,12 @@
 package com.ledger.config;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.logging.Logger;
@@ -72,6 +76,7 @@ public final class TenantPathResolver {
             LOG.severe("Resolved path escapes tenant root: " + abs);
             throw new SecurityException("Resolved tenant path escapes tenant root");
         }
+        assertNoSymlinkOrJunction(candidate, Paths.get(TENANT_ROOT));
         // Return relative form used by the rest of the system
         return candidate.toString().replace('\\', '/');
     }
@@ -115,6 +120,78 @@ public final class TenantPathResolver {
         // Tenant DBs must live under TENANT_ROOT (or legacy data/ for system/default)
         if (!s.startsWith(TENANT_ROOT + "/") && !s.startsWith("data/")) {
             throw new SecurityException("Database path outside allowed roots: " + dbPath);
+        }
+        Path allowedRoot = s.startsWith(TENANT_ROOT + "/") ? Paths.get(TENANT_ROOT) : Paths.get("data");
+        assertNoSymlinkOrJunction(p, allowedRoot);
+    }
+
+    /**
+     * Validate actual filesystem paths against symlinks, Windows NTFS junctions /
+     * reparse points, and canonical root escapes. Also checks -wal / -shm sidecars.
+     */
+    public static void assertNoSymlinkOrJunction(Path targetPath, Path allowedRootDir) {
+        if (targetPath == null || allowedRootDir == null) {
+            throw new SecurityException("Path validation arguments must not be null");
+        }
+        Path workspaceAbs = Paths.get("").toAbsolutePath().normalize();
+        Path absRoot = allowedRootDir.toAbsolutePath().normalize();
+        Path absTarget = targetPath.toAbsolutePath().normalize();
+        if (!absTarget.startsWith(absRoot)) {
+            throw new SecurityException("Resolved path escapes allowed root: " + absTarget);
+        }
+
+        try {
+            Path workspaceReal = workspaceAbs.toRealPath();
+            // Walk from workspace root through every existing path segment down to absTarget
+            if (absTarget.startsWith(workspaceAbs)) {
+                Path rel = workspaceAbs.relativize(absTarget);
+                Path curr = workspaceAbs;
+                for (Path segment : rel) {
+                    curr = curr.resolve(segment);
+                    verifySinglePathSegment(curr, workspaceReal);
+                }
+            } else {
+                verifySinglePathSegment(absTarget, absRoot);
+            }
+
+            if (Files.exists(absRoot, LinkOption.NOFOLLOW_LINKS)) {
+                Path realRoot = absRoot.toRealPath();
+                if (Files.exists(absTarget, LinkOption.NOFOLLOW_LINKS)) {
+                    Path realTarget = absTarget.toRealPath();
+                    if (!realTarget.startsWith(realRoot)) {
+                        throw new SecurityException("Real canonical path escapes allowed root: " + realTarget);
+                    }
+                }
+            }
+
+            // Check SQLite WAL/SHM sidecar paths if present
+            verifySinglePathSegment(Paths.get(absTarget.toString() + "-wal"), workspaceReal);
+            verifySinglePathSegment(Paths.get(absTarget.toString() + "-shm"), workspaceReal);
+        } catch (SecurityException se) {
+            throw se;
+        } catch (IOException ioe) {
+            throw new SecurityException("Filesystem canonical path validation failed: " + ioe.getMessage(), ioe);
+        }
+    }
+
+    private static void verifySinglePathSegment(Path curr, Path boundaryReal) throws IOException {
+        if (!Files.exists(curr, LinkOption.NOFOLLOW_LINKS)) {
+            return;
+        }
+        if (Files.isSymbolicLink(curr)) {
+            throw new SecurityException("Symbolic link rejected in protected path: " + curr);
+        }
+        BasicFileAttributes attrs = Files.readAttributes(curr, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        if (attrs.isSymbolicLink() || attrs.isOther()) {
+            throw new SecurityException("Symlink or Windows junction/reparse point rejected: " + curr);
+        }
+        Path realFollow = curr.toRealPath();
+        Path realNoFollow = curr.toRealPath(LinkOption.NOFOLLOW_LINKS);
+        if (!realFollow.equals(realNoFollow)) {
+            throw new SecurityException("Canonical path mismatch (symlink/junction suspected): " + curr);
+        }
+        if (!realFollow.startsWith(boundaryReal)) {
+            throw new SecurityException("Canonical path escapes boundary root: " + realFollow);
         }
     }
 }

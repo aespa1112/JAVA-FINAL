@@ -2,6 +2,7 @@ package com.ledger.config;
 
 import com.ledger.exception.BusinessException;
 import com.ledger.model.OperatorRole;
+import com.ledger.service.AuthService;
 
 import java.time.Instant;
 import java.util.Map;
@@ -52,6 +53,9 @@ public final class SessionContext {
     private static final Map<String, SessionInfo> activeSessions = new ConcurrentHashMap<>();
     private static final Set<String> revokedUsers = ConcurrentHashMap.newKeySet();
 
+    private static final StackWalker STACK_WALKER =
+            StackWalker.getInstance(StackWalker.Option.RETAIN_CLASS_REFERENCE);
+
     private static volatile boolean testIdentityProviderEnabled = false;
     private static volatile String testIdentityUser;
 
@@ -98,7 +102,29 @@ public final class SessionContext {
         return s.toLowerCase();
     }
 
-    public static void setUser(String canonicalName, String displayName) {
+    /**
+     * Establish an authenticated session from a credential-verified AuthService token.
+     * Direct callers outside AuthService are rejected.
+     */
+    public static void establishSession(AuthService.SessionToken token) {
+        Class<?> caller = STACK_WALKER.getCallerClass();
+        if (caller != AuthService.class) {
+            throw new SecurityException("Only AuthService may establish authenticated sessions (caller=" + caller.getName() + ")");
+        }
+        if (token == null || token.username() == null || token.username().isBlank()) {
+            throw new BusinessException("無效的驗證憑證，無法建立 Session");
+        }
+        if (!token.enabled()) {
+            throw new BusinessException("已停用帳號不可建立 Session: " + token.username());
+        }
+        String normLower = normalizeUsernameKey(token.username());
+        if (revokedUsers.contains(normLower)) {
+            throw new BusinessException("此帳號已停用或憑證已撤銷，禁止建立 Session: " + token.username());
+        }
+        setUser(token.username(), token.displayName());
+    }
+
+    private static void setUser(String canonicalName, String displayName) {
         String previousSid = currentSessionId.get();
         if (previousSid != null) {
             SessionInfo prev = activeSessions.remove(previousSid);
@@ -112,7 +138,9 @@ public final class SessionContext {
             return;
         }
         String normLower = normalizeUsernameKey(canonicalName);
-        revokedUsers.remove(normLower);
+        if (revokedUsers.contains(normLower)) {
+            throw new BusinessException("此帳號已停用或憑證已撤銷，禁止建立 Session: " + canonicalName);
+        }
         String sid = UUID.randomUUID().toString();
         SessionInfo info = new SessionInfo(sid, canonicalName, displayName != null ? displayName : canonicalName);
         activeSessions.put(sid, info);
@@ -180,19 +208,16 @@ public final class SessionContext {
     public static boolean isLoggedIn() {
         Boolean e = enabled.get();
         String u = currentUser.get();
-        if (!Boolean.TRUE.equals(e) || u == null || u.isBlank()) {
+        String sid = currentSessionId.get();
+        if (!Boolean.TRUE.equals(e) || u == null || u.isBlank() || sid == null || sid.isBlank()) {
             return false;
         }
         String uLower = normalizeUsernameKey(u);
         if (revokedUsers.contains(uLower)) {
             return false;
         }
-        String sid = currentSessionId.get();
-        if (sid != null) {
-            SessionInfo info = activeSessions.get(sid);
-            return info != null && info.active.get();
-        }
-        return true;
+        SessionInfo info = activeSessions.get(sid);
+        return info != null && info.active.get() && normalizeUsernameKey(info.username).equals(uLower);
     }
 
     public static void invalidate() {
@@ -235,9 +260,18 @@ public final class SessionContext {
     }
 
     public static void clearUserRevocation(String username) {
+        Class<?> caller = STACK_WALKER.getCallerClass();
+        if (caller != AuthService.class) {
+            throw new SecurityException("Only AuthService may clear user revocation");
+        }
         if (username != null && !username.isBlank()) {
             revokedUsers.remove(normalizeUsernameKey(username));
         }
+    }
+
+    public static boolean isUserRevoked(String username) {
+        return username != null && !username.isBlank()
+                && revokedUsers.contains(normalizeUsernameKey(username));
     }
 
     public static String requireUser() {

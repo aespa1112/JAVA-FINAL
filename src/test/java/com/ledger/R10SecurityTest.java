@@ -42,6 +42,9 @@ public class R10SecurityTest {
         if (Files.exists(wal)) Files.delete(wal);
         Path shm = Paths.get(TenantSecurityService.AUTH_DB_PATH + "-shm");
         if (Files.exists(shm)) Files.delete(shm);
+        Files.deleteIfExists(Paths.get("data/system_users.db"));
+        Files.deleteIfExists(Paths.get("data/system_users.db-wal"));
+        Files.deleteIfExists(Paths.get("data/system_users.db-shm"));
         TenantSecurityService.initDb();
         DbManager.clearMigrationFailureHook();
     }
@@ -123,6 +126,7 @@ public class R10SecurityTest {
     @Test
     @DisplayName("R10-02a Thread A 使用者登入後不影響 Thread B")
     void sessionIsolationAcrossThreads() throws Exception {
+        com.ledger.service.AuthService auth = new com.ledger.service.AuthService();
         ExecutorService pool = Executors.newFixedThreadPool(2);
         try {
             CountDownLatch ready = new CountDownLatch(2);
@@ -132,7 +136,7 @@ public class R10SecurityTest {
 
             Future<?> fa = pool.submit(() -> {
                 try {
-                    SessionContext.setUser("Alice", "Alice Display");
+                    auth.login("amy", "amy123");
                     SessionContext.setTenantId("tenant_alice");
                     ready.countDown();
                     go.await(5, TimeUnit.SECONDS);
@@ -146,7 +150,7 @@ public class R10SecurityTest {
 
             Future<?> fb = pool.submit(() -> {
                 try {
-                    SessionContext.setUser("Bob", "Bob Display");
+                    auth.login("bob", "bob123");
                     SessionContext.setTenantId("tenant_bob");
                     ready.countDown();
                     go.await(5, TimeUnit.SECONDS);
@@ -163,7 +167,7 @@ public class R10SecurityTest {
             fa.get(5, TimeUnit.SECONDS);
             fb.get(5, TimeUnit.SECONDS);
 
-            assertEquals("Alice|tenant_alice", seenOnA.get());
+            assertEquals("Amy|tenant_alice", seenOnA.get());
             assertEquals("Bob|tenant_bob", seenOnB.get());
         } finally {
             pool.shutdownNow();
@@ -173,10 +177,11 @@ public class R10SecurityTest {
     @Test
     @DisplayName("R10-02b 執行緒結束後 Session 正確清除")
     void sessionClearedAfterThread() throws Exception {
+        com.ledger.service.AuthService auth = new com.ledger.service.AuthService();
         ExecutorService pool = Executors.newSingleThreadExecutor();
         try {
             pool.submit(() -> {
-                SessionContext.setUser("TempUser", "Temp");
+                auth.login("amy", "amy123");
                 SessionContext.setTenantId("temp_tenant");
                 assertTrue(SessionContext.isLoggedIn());
                 SessionContext.clear();
@@ -194,8 +199,9 @@ public class R10SecurityTest {
     @Test
     @DisplayName("R10-02c Exception 時 Session 仍會清除 (try-finally pattern)")
     void sessionClearedOnException() {
+        com.ledger.service.AuthService auth = new com.ledger.service.AuthService();
         try {
-            SessionContext.setUser("ExUser", "Ex");
+            auth.login("amy", "amy123");
             SessionContext.setTenantId("ex_tenant");
             throw new RuntimeException("boom");
         } catch (RuntimeException expected) {
@@ -210,10 +216,11 @@ public class R10SecurityTest {
     @Test
     @DisplayName("R10-02d Thread Pool 重複使用不會殘留上一個使用者")
     void threadPoolNoLeak() throws Exception {
+        com.ledger.service.AuthService auth = new com.ledger.service.AuthService();
         ExecutorService pool = Executors.newFixedThreadPool(1);
         try {
             pool.submit(() -> {
-                SessionContext.setUser("First", "First");
+                auth.login("amy", "amy123");
                 SessionContext.setTenantId("first_t");
             }).get(3, TimeUnit.SECONDS);
 
