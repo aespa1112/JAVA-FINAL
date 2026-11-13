@@ -56,6 +56,8 @@ public class LedgerSystemTest {
 
     @BeforeEach
     void setUp() throws SQLException, IOException {
+        DbManager.clearCurrentTenant();
+        DbManager.closeAllTenants();
         DbManager.closeCurrent();
         Path testDb = Paths.get(TEST_DB_PATH);
         if (Files.exists(testDb)) {
@@ -93,6 +95,8 @@ public class LedgerSystemTest {
     @AfterEach
     void tearDown() {
         SessionContext.clear();
+        DbManager.clearCurrentTenant();
+        DbManager.closeAllTenants();
         DbManager.closeCurrent();
         if (Files.exists(TEST_BACKUP_DIR)) {
             try (var stream = Files.walk(TEST_BACKUP_DIR)) {
@@ -2300,6 +2304,10 @@ public class LedgerSystemTest {
         try { Files.deleteIfExists(dbB); } catch (Exception ignored) {}
 
         try {
+            com.ledger.config.TenantSecurityService.initDb();
+            com.ledger.config.TenantSecurityService.grant(tenantA, "R7 multi-tenant isolation test");
+            com.ledger.config.TenantSecurityService.grant(tenantB, "R7 multi-tenant isolation test");
+
             // 獲取 Tenant A 專屬連線並設定專屬 client_id
             Connection connA = DbManager.getForTenant(tenantA);
             DbManager.setClientId(connA, "CLIENT-ALPHA-001");

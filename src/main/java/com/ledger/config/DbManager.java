@@ -124,8 +124,7 @@ public final class DbManager {
 
     @Deprecated
     public static String resolveTenantDbPath(String tenantId) {
-        String clean = tenantId.trim().replaceAll("[^a-zA-Z0-9_.-]", "_");
-        return "data/" + clean + ".db";
+        return TenantPathResolver.resolveDbPath(tenantId);
     }
 
     public static synchronized void closeTenant(String tenantId) {
@@ -218,9 +217,23 @@ public final class DbManager {
 
         String url = "jdbc:sqlite:" + dbPath;
         Connection conn = DriverManager.getConnection(url);
-        applyPragmas(conn);
-        migrateSchema(conn);
-        return conn;
+        try {
+            applyPragmas(conn);
+            migrateSchema(conn, dbPath);
+            return conn;
+        } catch (SQLException e) {
+            try {
+                conn.close();
+            } catch (SQLException ignored) {
+            }
+            throw e;
+        } catch (RuntimeException | Error e) {
+            try {
+                conn.close();
+            } catch (SQLException ignored) {
+            }
+            throw e;
+        }
     }
 
     private static Connection wrapNonClosing(Connection target) {
@@ -261,6 +274,10 @@ public final class DbManager {
     }
 
     public static void migrateSchema(Connection conn) throws SQLException {
+        migrateSchema(conn, currentDbPath);
+    }
+
+    public static void migrateSchema(Connection conn, String dbPath) throws SQLException {
         boolean tablesExist = false;
         try (Statement st = conn.createStatement();
              ResultSet rs = st.executeQuery(
@@ -276,7 +293,7 @@ public final class DbManager {
             try {
                 initFullSchema(conn);
                 setSchemaVersion(conn, CURRENT_SCHEMA_VERSION);
-                getOrInitClientId(conn, currentDbPath);
+                getOrInitClientId(conn, dbPath);
                 if (migrationFailureHook != null) {
                     migrationFailureHook.run();
                 }
@@ -311,7 +328,7 @@ public final class DbManager {
                 if (version < 3) {
                     ensureSystemTables(conn);
                     upgradeTriggers(conn);
-                    getOrInitClientId(conn, currentDbPath);
+                    getOrInitClientId(conn, dbPath);
                     maybeInjectFailure("after-v3-upgrade");
                 }
                 setSchemaVersion(conn, CURRENT_SCHEMA_VERSION);
@@ -325,6 +342,30 @@ public final class DbManager {
             } finally {
                 try { conn.setAutoCommit(originAutoCommit); } catch (SQLException ignored) {}
             }
+        } else {
+            ensureSystemMetaSchemaVersionSynced(conn, CURRENT_SCHEMA_VERSION);
+        }
+    }
+
+    private static void ensureSystemMetaSchemaVersionSynced(Connection conn, int version) throws SQLException {
+        boolean hasSchemaVersion = false;
+        boolean metaExists = false;
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery(
+                     "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='system_meta'")) {
+            if (rs.next() && rs.getInt(1) > 0) {
+                metaExists = true;
+            }
+        }
+        if (metaExists) {
+            try (Statement st = conn.createStatement();
+                 ResultSet rs = st.executeQuery(
+                         "SELECT 1 FROM system_meta WHERE meta_key = 'schema_version'")) {
+                hasSchemaVersion = rs.next();
+            }
+        }
+        if (!hasSchemaVersion) {
+            setSchemaVersion(conn, version);
         }
     }
 
@@ -367,6 +408,10 @@ public final class DbManager {
                  ResultSet rs = st.executeQuery(
                          "SELECT meta_value FROM system_meta WHERE meta_key = 'schema_version'")) {
                 if (!rs.next()) {
+                    int userVer = readUserVersion(conn);
+                    if (userVer > 0 && userVer <= CURRENT_SCHEMA_VERSION) {
+                        return userVer;
+                    }
                     throw new SQLException(
                             "system_meta exists but schema_version is missing — metadata damaged");
                 }
