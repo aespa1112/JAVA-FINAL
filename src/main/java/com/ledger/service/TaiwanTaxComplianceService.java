@@ -4,7 +4,12 @@ import com.ledger.exception.BusinessException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDate;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /**
@@ -63,10 +68,28 @@ public class TaiwanTaxComplianceService {
     /** 各主要稅制規則現行法定生效日對照表 */
     public static final Map<String, LocalDate> RULE_EFFECTIVE_DATES = Map.of(
             "VAT_STANDARD_5_PERCENT", LocalDate.of(1986, 4, 1),
+            "CIT_17_PERCENT_HISTORICAL", LocalDate.of(2010, 1, 1),
             "CIT_20_PERCENT_AND_THRESHOLD", LocalDate.of(2018, 1, 1),
+            "NON_RESIDENT_DIVIDEND_21_PERCENT", LocalDate.of(2018, 1, 1),
             "LOSS_CARRYFORWARD_10_YEARS", LocalDate.of(2009, 1, 21),
             "GUI_CHECKSUM_MOD_5_STANDARD", LocalDate.of(2023, 4, 1)
     );
+
+    public record AnnualLossRecord(int lossYear, long remainingLossMinor, boolean cpaCertifiedOrBlueReturn) {}
+
+    public record LossCarryforwardDetail(int lossYear, long originalAvailableMinor,
+                                         long appliedMinor, long remainingAfterMinor) {}
+
+    public record CitReconciliationSchedule(int taxYear,
+                                            long bookNetIncomeMinor,
+                                            long nonDeductibleExpenseMinor,
+                                            long taxExemptIncomeMinor,
+                                            long adjustedTaxableIncomeBeforeLossMinor,
+                                            long lossCarryforwardAppliedMinor,
+                                            long finalTaxableIncomeMinor,
+                                            CitResult citResult,
+                                            List<LossCarryforwardDetail> appliedDetails,
+                                            FilingStatus filingStatus) {}
 
     private static final Pattern UNIFORM_INVOICE_PATTERN = Pattern.compile("^[A-Z]{2}-?\\d{8}$");
     private static final Pattern GUI_PATTERN = Pattern.compile("^\\d{8}$");
@@ -173,6 +196,56 @@ public class TaiwanTaxComplianceService {
     }
 
     /**
+     * 統一發票完整合規檢核（含開立日期與民國年期別一致性、賣方/買方統一編號檢查碼、及進項扣抵資格）。
+     */
+    public InvoiceValidationResult validateUniformInvoiceDetails(String invoiceNo,
+                                                                 LocalDate invoiceDate,
+                                                                 int rocYear,
+                                                                 int biMonthlyPeriod,
+                                                                 String sellerGui,
+                                                                 String buyerGui,
+                                                                 boolean claimingInputDeduction,
+                                                                 long salesMinor,
+                                                                 long vatMinor,
+                                                                 long totalMinor,
+                                                                 TaxType taxType) {
+        InvoiceValidationResult base = validateUniformInvoice(
+                invoiceNo, rocYear, biMonthlyPeriod, salesMinor, vatMinor, totalMinor, taxType);
+        if (!base.valid()) {
+            return base;
+        }
+        if (invoiceDate == null) {
+            return new InvoiceValidationResult(false, "發票開立日期不可為空");
+        }
+        int expectedRocYear = invoiceDate.getYear() - 1911;
+        if (expectedRocYear != rocYear) {
+            return new InvoiceValidationResult(false,
+                    "發票日期所屬民國年（" + expectedRocYear + "）與申報民國年（" + rocYear + "）不符");
+        }
+        int expectedPeriod = (invoiceDate.getMonthValue() + 1) / 2;
+        if (expectedPeriod != biMonthlyPeriod) {
+            return new InvoiceValidationResult(false,
+                    "發票日期所屬雙月期別（第 " + expectedPeriod + " 期）與申報期別（第 " + biMonthlyPeriod + " 期）不符");
+        }
+        if (!isValidGuiNumber(sellerGui)) {
+            return new InvoiceValidationResult(false, "賣方統一編號無效或未通過檢查碼驗證");
+        }
+        boolean hasBuyerGui = buyerGui != null && !buyerGui.isBlank();
+        if (hasBuyerGui && !isValidGuiNumber(buyerGui)) {
+            return new InvoiceValidationResult(false, "買方統一編號無效或未通過檢查碼驗證");
+        }
+        if (claimingInputDeduction) {
+            if (!hasBuyerGui) {
+                return new InvoiceValidationResult(false, "申報進項稅額扣抵須載明合法買受人統一編號");
+            }
+            if (taxType != TaxType.TAXABLE_5_PERCENT) {
+                return new InvoiceValidationResult(false, "零稅率或免稅發票無進項稅額可供扣抵");
+            }
+        }
+        return new InvoiceValidationResult(true, "符合統一發票完整合規邏輯（內部檢核）");
+    }
+
+    /**
      * 加值型營業稅 5% 試算（單位：分）。
      */
     public VatResult calculateVat(long amountMinor, boolean isTaxInclusive) {
@@ -183,6 +256,19 @@ public class TaiwanTaxComplianceService {
      * 加值型營業稅試算（支援應稅 5%、零稅率 0%、免稅）。
      */
     public VatResult calculateVat(long amountMinor, TaxType taxType, boolean isTaxInclusive) {
+        return calculateVat(amountMinor, taxType, isTaxInclusive, LocalDate.now());
+    }
+
+    /**
+     * 加值型營業稅試算（依交易日檢核法規適用日：1986-04-01 起適用現行加值型 5% 稅制）。
+     */
+    public VatResult calculateVat(long amountMinor, TaxType taxType, boolean isTaxInclusive, LocalDate transactionDate) {
+        if (transactionDate == null) {
+            throw new BusinessException("交易日期不可為空");
+        }
+        if (transactionDate.isBefore(RULE_EFFECTIVE_DATES.get("VAT_STANDARD_5_PERCENT"))) {
+            throw new BusinessException("交易日期早於現行加值型營業稅法施行日（1986-04-01）: " + transactionDate);
+        }
         if (amountMinor < 0) {
             throw new BusinessException("營業稅計算金額不可為負");
         }
@@ -256,47 +342,140 @@ public class TaiwanTaxComplianceService {
     }
 
     /**
-     * 營利事業所得稅試算（所得稅法第 5 條第 5 項）：
-     * - 課稅所得額 <= 120,000 元：免徵
-     * - 超過 120,000 元至 200,000 元以下：應納稅額不超過超過 120,000 元部分之半數
-     * - 超過 200,000 元：適用全額 20% 稅率
+     * 產生營利事業所得稅課稅所得額調節表（依所得稅法第 39 條逐年追蹤前十年虧損扣抵，檢核十年期限與簽證／藍色申報要件）。
      */
-    public CitResult calculateCorporateIncomeTax(long annualTaxableIncomeMinor) {
-        if (annualTaxableIncomeMinor <= CIT_EXEMPTION_MINOR) {
-            return new CitResult(annualTaxableIncomeMinor, 0L,
-                    "免稅（未逾新臺幣 120,000 元起徵額）", FilingStatus.INTERNAL_ESTIMATE_ONLY);
+    public CitReconciliationSchedule generateCitReconciliationSchedule(int taxYear,
+                                                                       long bookNetIncomeMinor,
+                                                                       long nonDeductibleExpenseMinor,
+                                                                       long taxExemptIncomeMinor,
+                                                                       List<AnnualLossRecord> priorLosses) {
+        if (nonDeductibleExpenseMinor < 0 || taxExemptIncomeMinor < 0) {
+            throw new BusinessException("帳外不可減除費用與免稅所得調整項不可為負");
         }
-        long fullTwentyPercent = BigDecimal.valueOf(annualTaxableIncomeMinor)
-                .multiply(new BigDecimal("0.20"))
-                .setScale(0, RoundingMode.HALF_UP)
-                .longValueExact();
-        long halfExcessCap = (annualTaxableIncomeMinor - CIT_EXEMPTION_MINOR) / 2;
-        if (halfExcessCap < fullTwentyPercent) {
-            return new CitResult(annualTaxableIncomeMinor, halfExcessCap,
-                    "適用半數課稅上限規定（應納稅額不得超過逾 120,000 元部分之 50%）",
-                    FilingStatus.INTERNAL_ESTIMATE_ONLY);
+        long adjustedBeforeLoss = bookNetIncomeMinor + nonDeductibleExpenseMinor - taxExemptIncomeMinor;
+        long remainingTaxable = Math.max(0L, adjustedBeforeLoss);
+        long totalLossApplied = 0L;
+        List<LossCarryforwardDetail> details = new ArrayList<>();
+
+        if (priorLosses != null && !priorLosses.isEmpty()) {
+            List<AnnualLossRecord> sorted = new ArrayList<>(priorLosses);
+            sorted.sort(Comparator.comparingInt(AnnualLossRecord::lossYear));
+            Set<Integer> seenYears = new HashSet<>();
+            for (AnnualLossRecord rec : sorted) {
+                if (rec == null) {
+                    throw new BusinessException("虧損年度紀錄不可為空");
+                }
+                if (!seenYears.add(rec.lossYear())) {
+                    throw new BusinessException("前十年虧損紀錄包含重複年度: " + rec.lossYear());
+                }
+                if (rec.lossYear() >= taxYear) {
+                    throw new BusinessException("虧損年度（" + rec.lossYear() + "）必須早於申報課稅年度（" + taxYear + "）");
+                }
+                if (taxYear - rec.lossYear() > 10) {
+                    throw new BusinessException("所得稅法第 39 條：年度 " + rec.lossYear()
+                            + " 核定虧損已逾十年法定扣抵期限（申報年度 " + taxYear + "），不得列報扣抵");
+                }
+                if (rec.remainingLossMinor() < 0) {
+                    throw new BusinessException("年度 " + rec.lossYear() + " 可扣抵虧損金額不可為負");
+                }
+                if (!rec.cpaCertifiedOrBlueReturn()) {
+                    throw new BusinessException("所得稅法第 39 條：年度 " + rec.lossYear()
+                            + " 未經會計師查核簽證申報或未使用藍色申報書，不得適用虧損扣抵");
+                }
+                long available = rec.remainingLossMinor();
+                long applied = Math.min(remainingTaxable, available);
+                remainingTaxable -= applied;
+                totalLossApplied += applied;
+                details.add(new LossCarryforwardDetail(
+                        rec.lossYear(), available, applied, available - applied));
+            }
         }
-        return new CitResult(annualTaxableIncomeMinor, fullTwentyPercent,
-                "適用標準稅率 20%", FilingStatus.INTERNAL_ESTIMATE_ONLY);
+
+        CitResult citResult = calculateCorporateIncomeTax(remainingTaxable, taxYear);
+        return new CitReconciliationSchedule(
+                taxYear,
+                bookNetIncomeMinor,
+                nonDeductibleExpenseMinor,
+                taxExemptIncomeMinor,
+                adjustedBeforeLoss,
+                totalLossApplied,
+                remainingTaxable,
+                citResult,
+                List.copyOf(details),
+                FilingStatus.INTERNAL_ESTIMATE_ONLY
+        );
     }
 
     /**
-     * 各類所得扣繳稅額試算（依各類所得扣繳率標準）：
-     * - SALARY（薪資）: 居住者 5% / 非居住者 18%
-     * - RENT / PROFESSIONAL / ROYALTY / COMMISSION / INTEREST: 居住者 10% / 非居住者 20%
-     * - DIVIDEND（股利）: 居住者 0% / 非居住者 21%
-     * 居住者每次應扣繳稅額不超過新臺幣 2,000 元免予扣繳；非居住者給付日起 10 日內須辦理扣繳申報。
+     * 營利事業所得稅試算（現行年度規則）。
+     */
+    public CitResult calculateCorporateIncomeTax(long annualTaxableIncomeMinor) {
+        return calculateCorporateIncomeTax(annualTaxableIncomeMinor, LocalDate.now().getYear());
+    }
+
+    /**
+     * 依課稅年度區分版本化營所稅稅率（所得稅法第 5 條第 5 項）：
+     * - 2010–2017 年度：標準稅率 17%
+     * - 2018 年度起（含現行）：標準稅率 20%
+     * 皆適用 120,000 元起徵額及半數課稅上限規定。
+     */
+    public CitResult calculateCorporateIncomeTax(long annualTaxableIncomeMinor, int taxYear) {
+        if (taxYear < 2010) {
+            throw new BusinessException("歷史年度 " + taxYear + " 不在 2010 年起現行起徵額與營所稅率架構適用範圍內");
+        }
+        BigDecimal standardRate = (taxYear >= 2018) ? new BigDecimal("0.20") : new BigDecimal("0.17");
+        String rateLabel = (taxYear >= 2018) ? "20%" : "17%";
+
+        if (annualTaxableIncomeMinor <= CIT_EXEMPTION_MINOR) {
+            return new CitResult(annualTaxableIncomeMinor, 0L,
+                    taxYear + " 年度免稅（未逾新臺幣 120,000 元起徵額）", FilingStatus.INTERNAL_ESTIMATE_ONLY);
+        }
+        long fullTax = BigDecimal.valueOf(annualTaxableIncomeMinor)
+                .multiply(standardRate)
+                .setScale(0, RoundingMode.HALF_UP)
+                .longValueExact();
+        long halfExcessCap = (annualTaxableIncomeMinor - CIT_EXEMPTION_MINOR) / 2;
+        if (halfExcessCap < fullTax) {
+            return new CitResult(annualTaxableIncomeMinor, halfExcessCap,
+                    taxYear + " 年度適用半數課稅上限規定（標準稅率 " + rateLabel + "，不超過逾 120,000 元部分之 50%）",
+                    FilingStatus.INTERNAL_ESTIMATE_ONLY);
+        }
+        return new CitResult(annualTaxableIncomeMinor, fullTax,
+                taxYear + " 年度適用標準稅率 " + rateLabel, FilingStatus.INTERNAL_ESTIMATE_ONLY);
+    }
+
+    /**
+     * 各類所得扣繳稅額試算（依現行給付日適用稅率）。
      */
     public WithholdingResult calculateWithholding(long grossPayMinor, String incomeCategory, boolean isResident) {
+        return calculateWithholding(grossPayMinor, incomeCategory, isResident, LocalDate.now());
+    }
+
+    /**
+     * 各類所得扣繳稅額試算（依給付日區分法規版本，含 2018 年前後非居住者股利扣繳率 20% vs 21%）：
+     * - SALARY（薪資）: 居住者 5% / 非居住者 18%
+     * - RENT / PROFESSIONAL / ROYALTY / COMMISSION / INTEREST / COMPETITION_PRIZE: 居住者 10% / 非居住者 20%
+     * - RETIREMENT_SEVERANCE（退職所得）: 居住者 6% / 非居住者 18%
+     * - DIVIDEND（股利）: 居住者 0% / 非居住者 2018-01-01 前 20%、2018-01-01 起 21%
+     * 居住者每次應扣繳稅額不超過新臺幣 2,000 元免予扣繳；非居住者給付日起 10 日內須辦理扣繳申報。
+     */
+    public WithholdingResult calculateWithholding(long grossPayMinor, String incomeCategory,
+                                                  boolean isResident, LocalDate paymentDate) {
         if (grossPayMinor < 0) {
             throw new BusinessException("給付總額不可為負");
         }
+        if (paymentDate == null) {
+            throw new BusinessException("給付日期不可為空");
+        }
         String cat = incomeCategory == null ? "" : incomeCategory.trim().toUpperCase();
+        boolean post2018Dividend = !paymentDate.isBefore(RULE_EFFECTIVE_DATES.get("NON_RESIDENT_DIVIDEND_21_PERCENT"));
         BigDecimal rate = switch (cat) {
             case "SALARY" -> isResident ? new BigDecimal("0.05") : new BigDecimal("0.18");
-            case "RENT", "PROFESSIONAL", "ROYALTY", "COMMISSION", "INTEREST" ->
+            case "RENT", "PROFESSIONAL", "ROYALTY", "COMMISSION", "INTEREST", "COMPETITION_PRIZE" ->
                     isResident ? new BigDecimal("0.10") : new BigDecimal("0.20");
-            case "DIVIDEND" -> isResident ? BigDecimal.ZERO : new BigDecimal("0.21");
+            case "RETIREMENT_SEVERANCE" -> isResident ? new BigDecimal("0.06") : new BigDecimal("0.18");
+            case "DIVIDEND" -> isResident ? BigDecimal.ZERO
+                    : (post2018Dividend ? new BigDecimal("0.21") : new BigDecimal("0.20"));
             default -> throw new BusinessException("不支援的扣繳所得類別: " + incomeCategory);
         };
         long tax = BigDecimal.valueOf(grossPayMinor)

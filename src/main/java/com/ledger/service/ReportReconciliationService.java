@@ -153,7 +153,8 @@ public class ReportReconciliationService {
 
                     long bsCash = 0;
                     for (FinancialStatementItem item : bs) {
-                        if ("1101".equals(item.code()) || "1102".equals(item.code())) {
+                        if (com.ledger.dao.ReportDaoExtra.classifyAccount(item.code(), item.name(), "ASSET")
+                                == com.ledger.dao.ReportDaoExtra.CashFlowCategory.CASH) {
                             bsCash += item.amountMinor();
                         }
                     }

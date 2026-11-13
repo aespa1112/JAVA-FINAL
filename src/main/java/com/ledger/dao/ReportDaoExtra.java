@@ -4,9 +4,12 @@ import com.ledger.config.DbManager;
 import com.ledger.model.FinancialStatementItem;
 import java.sql.*;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * 補充報表：權益變動表與完整間接法現金流量表（依據 EAS / IAS 7 間接法）。
@@ -53,17 +56,24 @@ public class ReportDaoExtra {
     }
 
     public static CashFlowCategory classifyAccount(String code, String type) {
+        return classifyAccount(code, null, type);
+    }
+
+    public static CashFlowCategory classifyAccount(String code, String name, String type) {
         if (code == null) return CashFlowCategory.OPERATING_WC;
         String c = code.trim();
         CashFlowCategory custom = CUSTOM_CLASSIFICATIONS.get(c);
         if (custom != null) {
             return custom;
         }
-        if ("1101".equals(c) || "1102".equals(c)) {
+        String n = name != null ? name.trim() : "";
+        if (c.startsWith("110") || c.startsWith("111")
+                || ("ASSET".equalsIgnoreCase(type) && (n.contains("現金") || n.contains("銀行存款") || n.contains("零用金") || n.contains("約當現金")))) {
             return CashFlowCategory.CASH;
         }
         // 累計折舊（1402）與累計攤銷（1502）為資產減項評價科目，不得併入投資活動現金流
-        if ("1402".equals(c) || "1502".equals(c)) {
+        if ("1402".equals(c) || "1502".equals(c)
+                || ("ASSET".equalsIgnoreCase(type) && (n.contains("累計折舊") || n.contains("累計攤銷")))) {
             return CashFlowCategory.ACCUM_DEPR_AMORT;
         }
         if ("5208".equals(c) || "5209".equals(c)) {
@@ -88,7 +98,30 @@ public class ReportDaoExtra {
         return CashFlowCategory.OPERATING_WC;
     }
 
-    private record EntryRow(String code, String type, long debitMinor, long creditMinor) {}
+    /**
+     * 依完整科目表動態解析所有啟用中之「現金及約當現金」科目代碼（不再僅硬編碼 1101/1102）。
+     */
+    public static Set<String> resolveCashAccountCodes(Connection conn) throws SQLException {
+        Set<String> codes = new LinkedHashSet<>();
+        try (Statement st = conn.createStatement();
+             ResultSet rs = st.executeQuery("SELECT code, name, type FROM accounts WHERE enabled = 1")) {
+            while (rs.next()) {
+                String code = rs.getString(1);
+                String name = rs.getString(2);
+                String type = rs.getString(3);
+                if (classifyAccount(code, name, type) == CashFlowCategory.CASH) {
+                    codes.add(code);
+                }
+            }
+        }
+        if (codes.isEmpty()) {
+            codes.add("1101");
+            codes.add("1102");
+        }
+        return codes;
+    }
+
+    private record EntryRow(String code, String name, String type, long debitMinor, long creditMinor) {}
 
     public List<FinancialStatementItem> getEquityChanges(String startDate, String endDate) throws SQLException {
         try (Connection conn = DbManager.get()) {
@@ -125,7 +158,7 @@ public class ReportDaoExtra {
     public List<FinancialStatementItem> getCashFlow(Connection conn, String startDate, String endDate) throws SQLException {
         Map<Long, List<EntryRow>> vouchers = new LinkedHashMap<>();
         StringBuilder sql = new StringBuilder(
-                "SELECT v.id, a.code, a.type, e.debit_minor, e.credit_minor " +
+                "SELECT v.id, a.code, a.name, a.type, e.debit_minor, e.credit_minor " +
                 "FROM voucher_entries e " +
                 "JOIN vouchers v ON v.id = e.voucher_id " +
                 "JOIN accounts a ON a.id = e.account_id " +
@@ -141,7 +174,7 @@ public class ReportDaoExtra {
             sql.append(" AND v.voucher_date <= ?");
             params.add(endDate.trim());
         }
-        sql.append(" ORDER BY v.id, e.line_no");
+        sql.append(" ORDER BY v.voucher_date, v.id, e.line_no");
 
         try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
             for (int i = 0; i < params.size(); i++) {
@@ -151,7 +184,7 @@ public class ReportDaoExtra {
                 while (rs.next()) {
                     long vid = rs.getLong(1);
                     vouchers.computeIfAbsent(vid, k -> new ArrayList<>())
-                            .add(new EntryRow(rs.getString(2), rs.getString(3), rs.getLong(4), rs.getLong(5)));
+                            .add(new EntryRow(rs.getString(2), rs.getString(3), rs.getString(4), rs.getLong(5), rs.getLong(6)));
                 }
             }
         }
@@ -166,63 +199,112 @@ public class ReportDaoExtra {
         long finCashNet = 0;
         long nonCashInvFinTotal = 0;
 
+        Map<String, Long> unpaidInvestingPayables = new HashMap<>();
+        Map<String, Long> uncollectedInvestingReceivables = new HashMap<>();
+
         for (List<EntryRow> rows : vouchers.values()) {
             boolean hasCash = false;
             boolean hasDeprOrAmort = false;
             boolean hasDisposal = false;
             boolean touchesInvesting = false;
             boolean touchesFinancing = false;
-            long nonCashBasisDr = 0;
-            long nonCashBasisCr = 0;
+            long voucherCashDrMinusCr = 0;
+            long invDrMinusCr = 0;
+            long invCrMinusDrTotal = 0;
+            long disposalGainLossCrMinusDr = 0;
+            long financingDr = 0;
+            long financingCr = 0;
 
             for (EntryRow r : rows) {
-                CashFlowCategory cat = classifyAccount(r.code(), r.type());
+                CashFlowCategory cat = classifyAccount(r.code(), r.name(), r.type());
+                long crMinusDr = r.creditMinor() - r.debitMinor();
+                long drMinusCr = r.debitMinor() - r.creditMinor();
                 switch (cat) {
-                    case CASH -> hasCash = true;
+                    case CASH -> {
+                        hasCash = true;
+                        voucherCashDrMinusCr += drMinusCr;
+                    }
                     case DEPR_AMORT_EXPENSE -> hasDeprOrAmort = true;
-                    case DISPOSAL_GAIN_LOSS -> hasDisposal = true;
+                    case DISPOSAL_GAIN_LOSS -> {
+                        hasDisposal = true;
+                        disposalGainLossCrMinusDr += crMinusDr;
+                    }
                     case INVESTING -> {
                         touchesInvesting = true;
-                        nonCashBasisDr += r.debitMinor();
-                        nonCashBasisCr += r.creditMinor();
+                        invDrMinusCr += drMinusCr;
+                        invCrMinusDrTotal += crMinusDr;
                     }
+                    case ACCUM_DEPR_AMORT -> invCrMinusDrTotal += crMinusDr;
                     case FINANCING -> {
                         touchesFinancing = true;
-                        nonCashBasisDr += r.debitMinor();
-                        nonCashBasisCr += r.creditMinor();
+                        financingDr += r.debitMinor();
+                        financingCr += r.creditMinor();
                     }
                     default -> {
-                        // Other categories checked in second pass
+                        // Checked in second pass
                     }
                 }
             }
 
-            if (!hasCash) {
-                // 非現金投資/籌資交易（如賒購設備、債務轉增資等）不計入各類現金流量，僅單獨揭露
-                if ((touchesInvesting || touchesFinancing) && !hasDeprOrAmort) {
-                    nonCashInvFinTotal += Math.max(nonCashBasisDr, nonCashBasisCr);
-                    // 若為非現金處分（如應收處分設備款），保留損益以便間接法自淨利加回/扣除，不影響 CFO/CFI
-                    if (hasDisposal) {
-                        for (EntryRow r : rows) {
-                            CashFlowCategory cat = classifyAccount(r.code(), r.type());
-                            if (cat == CashFlowCategory.DISPOSAL_GAIN_LOSS) {
-                                long crMinusDr = r.creditMinor() - r.debitMinor();
-                                if (crMinusDr >= 0) {
-                                    revNet += crMinusDr;
-                                    disposalGain += crMinusDr;
-                                } else {
-                                    expNet += -crMinusDr;
-                                    disposalLoss += -crMinusDr;
-                                }
+            // 情況 A：購置長期資產（含全額付現、全額賒購、及「部分現金＋部分賒購/負債」混合交易）
+            if (touchesInvesting && invDrMinusCr > 0 && !hasDisposal) {
+                long cashPaidForInv = hasCash ? Math.min(invDrMinusCr, Math.max(0L, -voucherCashDrMinusCr)) : 0L;
+                long nonCashInv = invDrMinusCr - cashPaidForInv;
+                invCashNet -= cashPaidForInv;
+                nonCashInvFinTotal += nonCashInv;
+
+                long remainingNonCashToMatch = nonCashInv;
+                for (EntryRow r : rows) {
+                    CashFlowCategory cat = classifyAccount(r.code(), r.name(), r.type());
+                    long crMinusDr = r.creditMinor() - r.debitMinor();
+                    long drMinusCr = r.debitMinor() - r.creditMinor();
+                    switch (cat) {
+                        case REVENUE -> revNet += crMinusDr;
+                        case EXPENSE -> expNet += drMinusCr;
+                        case DEPR_AMORT_EXPENSE -> {
+                            expNet += drMinusCr;
+                            deprAmort += drMinusCr;
+                        }
+                        case OPERATING_WC -> {
+                            if (crMinusDr > 0 && remainingNonCashToMatch > 0) {
+                                long absorbed = Math.min(crMinusDr, remainingNonCashToMatch);
+                                unpaidInvestingPayables.merge(r.code(), absorbed, Long::sum);
+                                remainingNonCashToMatch -= absorbed;
+                                wcNet += (crMinusDr - absorbed);
+                            } else {
+                                wcNet += crMinusDr;
                             }
                         }
+                        case FINANCING -> {
+                            if (crMinusDr > 0 && remainingNonCashToMatch > 0) {
+                                long absorbed = Math.min(crMinusDr, remainingNonCashToMatch);
+                                remainingNonCashToMatch -= absorbed;
+                                finCashNet += (crMinusDr - absorbed);
+                            } else {
+                                finCashNet += crMinusDr;
+                            }
+                        }
+                        case CASH, INVESTING, ACCUM_DEPR_AMORT, DISPOSAL_GAIN_LOSS -> {
+                            // Handled above
+                        }
                     }
-                    continue;
                 }
+                continue;
+            }
 
-                // 純折舊與攤銷提列傳票（不含現金收付）只影響淨利及折舊攤銷加回，不計入投資現金流
+            // 情況 B：處分長期資產（含全額收現、應收款尚未收現、部分收現及累計折舊／處分損益沖轉）
+            if (hasDisposal || (touchesInvesting && invDrMinusCr < 0)) {
+                long totalProceeds = invCrMinusDrTotal + disposalGainLossCrMinusDr;
+                long cashReceivedFromDisp = hasCash
+                        ? Math.min(Math.max(0L, totalProceeds), Math.max(0L, voucherCashDrMinusCr))
+                        : 0L;
+                long nonCashDisp = Math.max(0L, totalProceeds - cashReceivedFromDisp);
+                invCashNet += cashReceivedFromDisp;
+                nonCashInvFinTotal += nonCashDisp;
+
+                long remainingReceivableToMatch = nonCashDisp;
                 for (EntryRow r : rows) {
-                    CashFlowCategory cat = classifyAccount(r.code(), r.type());
+                    CashFlowCategory cat = classifyAccount(r.code(), r.name(), r.type());
                     long crMinusDr = r.creditMinor() - r.debitMinor();
                     long drMinusCr = r.debitMinor() - r.creditMinor();
                     switch (cat) {
@@ -241,26 +323,38 @@ public class ReportDaoExtra {
                                 disposalLoss += -crMinusDr;
                             }
                         }
-                        case OPERATING_WC -> wcNet += crMinusDr;
-                        case ACCUM_DEPR_AMORT, INVESTING, FINANCING, CASH -> {
-                            // Non-cash contra-asset / asset lines excluded from cash investing/financing
+                        case OPERATING_WC -> {
+                            if (drMinusCr > 0 && remainingReceivableToMatch > 0) {
+                                long absorbed = Math.min(drMinusCr, remainingReceivableToMatch);
+                                uncollectedInvestingReceivables.merge(r.code(), absorbed, Long::sum);
+                                remainingReceivableToMatch -= absorbed;
+                                wcNet += -(drMinusCr - absorbed);
+                            } else {
+                                wcNet += crMinusDr;
+                            }
+                        }
+                        case FINANCING -> finCashNet += crMinusDr;
+                        case CASH, INVESTING, ACCUM_DEPR_AMORT -> {
+                            // Handled above
                         }
                     }
                 }
                 continue;
             }
 
-            // 含現金收付之傳票：逐張計算資產處分實際收取／支付之現金金額
-            long voucherInvNet = 0;
-            long voucherDisposalAdjInCash = 0;
+            // 情況 C：不含直接固定資產異動（純折舊提列、非現金籌資、分期償付設備款、收回處分應收款或一般營運／籌資）
+            if (!hasCash && touchesFinancing && !hasDeprOrAmort) {
+                nonCashInvFinTotal += Math.max(financingDr, financingCr);
+                continue;
+            }
+
             for (EntryRow r : rows) {
-                CashFlowCategory cat = classifyAccount(r.code(), r.type());
+                CashFlowCategory cat = classifyAccount(r.code(), r.name(), r.type());
                 long crMinusDr = r.creditMinor() - r.debitMinor();
                 long drMinusCr = r.debitMinor() - r.creditMinor();
-
                 switch (cat) {
                     case CASH -> {
-                        // Reconciled target
+                        // Target reconciled item
                     }
                     case REVENUE -> revNet += crMinusDr;
                     case EXPENSE -> expNet += drMinusCr;
@@ -276,19 +370,43 @@ public class ReportDaoExtra {
                             expNet += -crMinusDr;
                             disposalLoss += -crMinusDr;
                         }
-                        voucherDisposalAdjInCash += crMinusDr;
                     }
-                    case OPERATING_WC -> wcNet += crMinusDr;
-                    case INVESTING, ACCUM_DEPR_AMORT -> {
-                        if (touchesInvesting || hasDisposal) {
-                            voucherInvNet += crMinusDr;
+                    case OPERATING_WC -> {
+                        if (hasCash && drMinusCr > 0) {
+                            long pending = unpaidInvestingPayables.getOrDefault(r.code(), 0L);
+                            if ("2123".equals(r.code()) || pending > 0) {
+                                long matched = "2123".equals(r.code()) ? drMinusCr : Math.min(drMinusCr, pending);
+                                if (pending > 0) {
+                                    unpaidInvestingPayables.put(r.code(), Math.max(0L, pending - matched));
+                                }
+                                invCashNet -= matched;
+                                long rem = drMinusCr - matched;
+                                if (rem > 0) wcNet -= rem;
+                                continue;
+                            }
+                        }
+                        if (hasCash && crMinusDr > 0) {
+                            long pendingRec = uncollectedInvestingReceivables.getOrDefault(r.code(), 0L);
+                            if (pendingRec > 0) {
+                                long matched = Math.min(crMinusDr, pendingRec);
+                                uncollectedInvestingReceivables.put(r.code(), pendingRec - matched);
+                                invCashNet += matched;
+                                long rem = crMinusDr - matched;
+                                if (rem > 0) wcNet += rem;
+                                continue;
+                            }
+                        }
+                        wcNet += crMinusDr;
+                    }
+                    case FINANCING -> {
+                        if (hasCash) {
+                            finCashNet += crMinusDr;
                         }
                     }
-                    case FINANCING -> finCashNet += crMinusDr;
+                    case ACCUM_DEPR_AMORT, INVESTING -> {
+                        // Pure depreciation contra-asset lines never affect cash flow
+                    }
                 }
-            }
-            if (touchesInvesting || hasDisposal) {
-                invCashNet += (voucherInvNet + voucherDisposalAdjInCash);
             }
         }
 
@@ -411,33 +529,33 @@ public class ReportDaoExtra {
     }
 
     private long cashBalanceBefore(Connection conn, String start) throws SQLException {
-        StringBuilder sql = new StringBuilder(
-                "SELECT COALESCE(SUM(e.debit_minor - e.credit_minor),0) " +
-                "FROM voucher_entries e JOIN vouchers v ON v.id=e.voucher_id JOIN accounts a ON a.id=e.account_id " +
-                "WHERE v.status='POSTED' AND a.code IN ('1101','1102')"
-        );
-        if (start != null && !start.isBlank()) {
-            sql.append(" AND v.voucher_date < ?");
-        }
-        try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
-            if (start != null && !start.isBlank()) ps.setString(1, start.trim());
-            try (ResultSet rs = ps.executeQuery()) {
-                return rs.next() ? rs.getLong(1) : 0;
-            }
-        }
+        return sumCashAccounts(conn, start, true);
     }
 
     private long cashBalanceAsOf(Connection conn, String asOf) throws SQLException {
+        return sumCashAccounts(conn, asOf, false);
+    }
+
+    private long sumCashAccounts(Connection conn, String dateBound, boolean strictlyBefore) throws SQLException {
+        Set<String> cashCodes = resolveCashAccountCodes(conn);
+        String placeholders = String.join(",", java.util.Collections.nCopies(cashCodes.size(), "?"));
         StringBuilder sql = new StringBuilder(
                 "SELECT COALESCE(SUM(e.debit_minor - e.credit_minor),0) " +
                 "FROM voucher_entries e JOIN vouchers v ON v.id=e.voucher_id JOIN accounts a ON a.id=e.account_id " +
-                "WHERE v.status='POSTED' AND a.code IN ('1101','1102')"
+                "WHERE v.status='POSTED' AND a.code IN (" + placeholders + ")"
         );
-        if (asOf != null && !asOf.isBlank()) {
-            sql.append(" AND v.voucher_date <= ?");
+        boolean hasDate = dateBound != null && !dateBound.isBlank();
+        if (hasDate) {
+            sql.append(strictlyBefore ? " AND v.voucher_date < ?" : " AND v.voucher_date <= ?");
         }
         try (PreparedStatement ps = conn.prepareStatement(sql.toString())) {
-            if (asOf != null && !asOf.isBlank()) ps.setString(1, asOf.trim());
+            int idx = 1;
+            for (String code : cashCodes) {
+                ps.setString(idx++, code);
+            }
+            if (hasDate) {
+                ps.setString(idx, dateBound.trim());
+            }
             try (ResultSet rs = ps.executeQuery()) {
                 return rs.next() ? rs.getLong(1) : 0;
             }

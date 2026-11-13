@@ -290,63 +290,55 @@ public final class DbManager {
 
     static Connection createRawConnection(String dbPath) throws SQLException {
         boolean isMemory = ":memory:".equalsIgnoreCase(dbPath);
-        Path path = null;
         Path allowedRoot = null;
         Path preReal = null;
+        String url = "jdbc:sqlite:" + dbPath;
+        Connection conn;
+
         if (!isMemory) {
-            TenantPathResolver.assertSafePath(dbPath);
             String norm = normalizePathKey(dbPath);
             allowedRoot = norm.startsWith(TenantPathResolver.TENANT_ROOT + "/")
                     ? Paths.get(TenantPathResolver.TENANT_ROOT)
                     : Paths.get("data");
-            path = Paths.get(dbPath);
-            TenantPathResolver.assertNoSymlinkOrJunction(path, allowedRoot);
-            Path parent = path.getParent();
-            if (parent != null && !Files.exists(parent, LinkOption.NOFOLLOW_LINKS)) {
+            synchronized (TenantPathResolver.PATH_GUARD_LOCK) {
+                preReal = TenantPathResolver.prepareAndVerifyDatabaseFile(dbPath, allowedRoot);
+                conn = DriverManager.getConnection(url);
                 try {
-                    Files.createDirectories(parent);
-                } catch (Exception e) {
-                    throw new SQLException("無法建立資料庫目錄: " + parent, e);
+                    TenantPathResolver.verifyOpenedSqliteConnection(conn, preReal, allowedRoot);
+                    applyPragmas(conn);
+                    TenantPathResolver.verifyOpenedSqliteConnection(conn, preReal, allowedRoot);
+                } catch (Throwable t) {
+                    closeUnderlyingQuietly(conn);
+                    if (t instanceof SQLException se) throw se;
+                    if (t instanceof RuntimeException re) throw re;
+                    if (t instanceof Error err) throw err;
+                    throw new SQLException(t);
                 }
             }
-            TenantPathResolver.assertNoSymlinkOrJunction(path, allowedRoot);
-            if (Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
-                try {
-                    preReal = path.toRealPath(LinkOption.NOFOLLOW_LINKS);
-                } catch (Exception e) {
-                    throw new SecurityException("無法驗證資料庫實體路徑: " + dbPath, e);
-                }
+        } else {
+            conn = DriverManager.getConnection(url);
+            try {
+                applyPragmas(conn);
+            } catch (Throwable t) {
+                closeUnderlyingQuietly(conn);
+                if (t instanceof SQLException se) throw se;
+                if (t instanceof RuntimeException re) throw re;
+                if (t instanceof Error err) throw err;
+                throw new SQLException(t);
             }
         }
 
-        String url = "jdbc:sqlite:" + dbPath;
-        Connection conn = DriverManager.getConnection(url);
         try {
-            if (!isMemory) {
-                TenantPathResolver.assertNoSymlinkOrJunction(path, allowedRoot);
-                Path postReal = path.toRealPath(LinkOption.NOFOLLOW_LINKS);
-                Path rootReal = allowedRoot.toRealPath();
-                if (!postReal.startsWith(rootReal)) {
-                    throw new SecurityException("TOCTOU validation failed: DB path escaped root: " + postReal);
-                }
-                if (preReal != null && !preReal.equals(postReal)) {
-                    throw new SecurityException("TOCTOU race detected on database path: " + dbPath);
-                }
-            }
-            applyPragmas(conn);
             migrateSchema(conn, dbPath);
+            if (!isMemory) {
+                TenantPathResolver.verifyOpenedSqliteConnection(conn, preReal, allowedRoot);
+            }
             return conn;
         } catch (SQLException e) {
-            try {
-                conn.close();
-            } catch (SQLException ignored) {
-            }
+            closeUnderlyingQuietly(conn);
             throw e;
         } catch (Exception | Error e) {
-            try {
-                conn.close();
-            } catch (SQLException ignored) {
-            }
+            closeUnderlyingQuietly(conn);
             if (e instanceof SecurityException se) throw se;
             if (e instanceof RuntimeException re) throw re;
             if (e instanceof Error err) throw err;
@@ -686,14 +678,18 @@ public final class DbManager {
             int present = 0;
             try (Statement st = conn.createStatement();
                  ResultSet rs = st.executeQuery(
-                         "SELECT count(*) FROM accounts WHERE code IN ('1402','1501','2201','4202','5209','5302')")) {
+                         "SELECT count(*) FROM accounts WHERE code IN ('1103','1104','1402','1501','1502','2123','2201','4202','5209','5302')")) {
                 if (rs.next()) present = rs.getInt(1);
             }
-            if (present < 6) {
+            if (present < 10) {
                 try (Statement st = conn.createStatement()) {
                     st.execute("INSERT OR IGNORE INTO accounts (code, name, type, normal_side, is_leaf, enabled) VALUES " +
+                            "('1103', '零用金', 'ASSET', 'DEBIT', 1, 1)," +
+                            "('1104', '約當現金', 'ASSET', 'DEBIT', 1, 1)," +
                             "('1402', '累計折舊', 'ASSET', 'CREDIT', 1, 1)," +
                             "('1501', '無形資產', 'ASSET', 'DEBIT', 1, 1)," +
+                            "('1502', '累計攤銷', 'ASSET', 'CREDIT', 1, 1)," +
+                            "('2123', '應付設備款', 'LIABILITY', 'CREDIT', 1, 1)," +
                             "('2201', '長期借款', 'LIABILITY', 'CREDIT', 1, 1)," +
                             "('4202', '處分資產利益', 'REVENUE', 'CREDIT', 1, 1)," +
                             "('5209', '攤銷費用', 'EXPENSE', 'DEBIT', 1, 1)," +

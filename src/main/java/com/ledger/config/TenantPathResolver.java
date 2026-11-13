@@ -6,7 +6,12 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.sql.Connection;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.logging.Logger;
@@ -28,6 +33,9 @@ public final class TenantPathResolver {
 
     /** Fixed root directory for all tenant databases. */
     public static final String TENANT_ROOT = "data/tenants";
+
+    /** Serializes filesystem preparation, open, and post-open verification to mitigate TOCTOU races. */
+    public static final Object PATH_GUARD_LOCK = new Object();
 
     private TenantPathResolver() {
     }
@@ -155,7 +163,7 @@ public final class TenantPathResolver {
             }
 
             if (Files.exists(absRoot, LinkOption.NOFOLLOW_LINKS)) {
-                Path realRoot = absRoot.toRealPath();
+                Path realRoot = absRoot.toRealPath(LinkOption.NOFOLLOW_LINKS);
                 if (Files.exists(absTarget, LinkOption.NOFOLLOW_LINKS)) {
                     Path realTarget = absTarget.toRealPath();
                     if (!realTarget.startsWith(realRoot)) {
@@ -164,13 +172,108 @@ public final class TenantPathResolver {
                 }
             }
 
-            // Check SQLite WAL/SHM sidecar paths if present
-            verifySinglePathSegment(Paths.get(absTarget.toString() + "-wal"), workspaceReal);
-            verifySinglePathSegment(Paths.get(absTarget.toString() + "-shm"), workspaceReal);
+            // Check SQLite WAL/SHM/journal sidecar paths if present (tolerant of SQLite deleting transient sidecars mid-check)
+            verifySidecarPath(Paths.get(absTarget.toString() + "-wal"), workspaceReal);
+            verifySidecarPath(Paths.get(absTarget.toString() + "-shm"), workspaceReal);
+            verifySidecarPath(Paths.get(absTarget.toString() + "-journal"), workspaceReal);
         } catch (SecurityException se) {
             throw se;
         } catch (IOException ioe) {
             throw new SecurityException("Filesystem canonical path validation failed: " + ioe.getMessage(), ioe);
+        }
+    }
+
+    /**
+     * Atomically verifies and pre-creates a regular database file (if absent) before
+     * handing its path to SQLite JDBC, eliminating the window where pre-open realPath is null.
+     */
+    public static Path prepareAndVerifyDatabaseFile(String dbPath, Path allowedRootDir) {
+        synchronized (PATH_GUARD_LOCK) {
+            assertSafePath(dbPath);
+            Path absRoot = allowedRootDir.toAbsolutePath().normalize();
+            Path absTarget = Paths.get(dbPath).toAbsolutePath().normalize();
+            assertNoSymlinkOrJunction(absTarget, absRoot);
+
+            try {
+                Path parent = absTarget.getParent();
+                if (parent != null && !Files.exists(parent, LinkOption.NOFOLLOW_LINKS)) {
+                    Files.createDirectories(parent);
+                }
+                assertNoSymlinkOrJunction(absTarget, absRoot);
+
+                if (!Files.exists(absTarget, LinkOption.NOFOLLOW_LINKS)) {
+                    try {
+                        Files.newByteChannel(absTarget,
+                                StandardOpenOption.CREATE_NEW,
+                                StandardOpenOption.WRITE,
+                                LinkOption.NOFOLLOW_LINKS).close();
+                    } catch (java.nio.file.FileAlreadyExistsException ignored) {
+                        // Safe if another thread just created it cleanly; re-validated below
+                    }
+                }
+                assertNoSymlinkOrJunction(absTarget, absRoot);
+                return absTarget.toRealPath(LinkOption.NOFOLLOW_LINKS);
+            } catch (SecurityException se) {
+                throw se;
+            } catch (IOException ioe) {
+                throw new SecurityException("Unable to prepare/verify database path: " + ioe.getMessage(), ioe);
+            }
+        }
+    }
+
+    /**
+     * Verifies after opening that the underlying SQLite "main" file matches expectedRealDb,
+     * has no symlink/junction/reparse points on the DB, parent directory, or WAL/SHM sidecars,
+     * and remains confined within allowedRootDir.
+     */
+    public static void verifyOpenedSqliteConnection(Connection conn, Path expectedRealDb, Path allowedRootDir)
+            throws SQLException {
+        if (conn == null || expectedRealDb == null || allowedRootDir == null) {
+            throw new SecurityException("Opened SQLite connection verification arguments must not be null");
+        }
+        synchronized (PATH_GUARD_LOCK) {
+            assertNoSymlinkOrJunction(expectedRealDb, allowedRootDir);
+            try {
+                Path currentReal = expectedRealDb.toRealPath(LinkOption.NOFOLLOW_LINKS);
+                Path rootReal = allowedRootDir.toRealPath(LinkOption.NOFOLLOW_LINKS);
+                if (!currentReal.startsWith(rootReal)) {
+                    throw new SecurityException("TOCTOU validation failed: DB path escaped root: " + currentReal);
+                }
+                if (!currentReal.equals(expectedRealDb)) {
+                    throw new SecurityException("TOCTOU race detected on database path: " + expectedRealDb);
+                }
+                try (Statement st = conn.createStatement();
+                     ResultSet rs = st.executeQuery("PRAGMA database_list;")) {
+                    while (rs.next()) {
+                        String dbName = rs.getString(2);
+                        String filePath = rs.getString(3);
+                        if ("main".equalsIgnoreCase(dbName) && filePath != null && !filePath.isBlank()) {
+                            Path openedPath = Paths.get(filePath).toAbsolutePath().normalize();
+                            assertNoSymlinkOrJunction(openedPath, allowedRootDir);
+                            Path openedReal = openedPath.toRealPath(LinkOption.NOFOLLOW_LINKS);
+                            if (!openedReal.equals(expectedRealDb)) {
+                                throw new SecurityException("SQLite opened unexpected main DB file: " + openedReal);
+                            }
+                        }
+                    }
+                }
+            } catch (SecurityException se) {
+                throw se;
+            } catch (IOException ioe) {
+                throw new SecurityException("Post-open canonical verification failed: " + ioe.getMessage(), ioe);
+            }
+        }
+    }
+
+    private static void verifySidecarPath(Path sidecar, Path boundaryReal) throws IOException {
+        try {
+            verifySinglePathSegment(sidecar, boundaryReal);
+        } catch (java.nio.file.NoSuchFileException transientDeletedBySqlite) {
+            // SQLite checkpoints and removes -wal / -shm / -journal on connection close.
+            // Only treat as absent if no reparse/symlink exists at sidecar path now.
+            if (Files.isSymbolicLink(sidecar)) {
+                throw new SecurityException("Symbolic link rejected in protected sidecar path: " + sidecar);
+            }
         }
     }
 

@@ -19,6 +19,7 @@ import java.nio.file.attribute.AclEntry;
 import java.nio.file.attribute.AclEntryPermission;
 import java.nio.file.attribute.AclEntryType;
 import java.nio.file.attribute.AclFileAttributeView;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.UserPrincipal;
 import java.security.MessageDigest;
@@ -28,12 +29,21 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Logger;
+import javax.crypto.Cipher;
 import javax.crypto.Mac;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.GCMParameterSpec;
+import javax.crypto.spec.PBEKeySpec;
 import javax.crypto.spec.SecretKeySpec;
 
 /**
@@ -43,16 +53,28 @@ import javax.crypto.spec.SecretKeySpec;
  * - 原始憑證關聯記帳傳票、紀錄憑證字號/日期與 SHA-256 雜湊。
  * - 使用對稱式 HMAC-SHA256 進行內部完整性／來源防偽驗證（注意：HMAC 為對稱金鑰驗證碼，
  *   非 X.509 / PKI 非對稱公開金鑰數位簽章，不具對外第三方憑證機構不可否認性）。
- * - 金鑰存放於資料庫與附件目錄之外的 OS 受保護安全儲存檔（預設 {@code ~/.ledger_security/attachment_hmac_keys.properties}，
- *   可透過系統屬性 {@code -Dledger.hmac.keystore.path} 指定，禁止置於 {@code data/} 或 {@code attachments/}）。
- * - 支援金鑰版本控管（{@code key_version}）與安全輪替（{@link #rotateHmacKey(String)}）。
- * - 嚴格驗證附件存取路徑邊界（防止路徑穿越與符號連結／Junction 攻擊）。
+ * - 金鑰存放於資料庫與附件目錄之外的 OS 受保護安全儲存檔（預設 {@code ~/.ledger_security/attachment_hmac_keys.properties}），
+ *   金鑰內容以 AES-256-GCM 加密存放（Windows 優先採用 DPAPI CurrentUser 保護主金鑰；非支援環境採明確 PBKDF2＋強制 OS ACL 降級），
+ *   禁止置於 {@code data/} 或 {@code attachments/}，且檔案權限設定失敗時直接拒絕執行，不得靜默忽略。
+ * - 支援金鑰版本控管（{@code key_version}）與安全輪替（{@link #rotateHmacKey(String)}），保留舊版金鑰及輪替紀錄。
+ * - 嚴格驗證附件及金鑰父目錄路徑邊界（防止路徑穿越、符號連結／Junction 與檔案替換 TOCTOU 攻擊）。
  */
 public class AttachmentService {
 
+    public enum KeystoreProtectionMode {
+        WINDOWS_DPAPI_AES256_GCM,
+        FALLBACK_PBKDF2_AES256_GCM_OS_ACL
+    }
+
+    private static final Logger LOG = Logger.getLogger(AttachmentService.class.getName());
     public static final String SIGNATURE_MECHANISM = "SYMMETRIC_HMAC_SHA256_INTERNAL_INTEGRITY_NOT_PKI";
     private static final String KEYSTORE_SYS_PROP = "ledger.hmac.keystore.path";
+    private static final String FORCE_FALLBACK_PROP = "ledger.hmac.forceFallback";
+    private static final String ENC_PREFIX = "ENCv1:";
     private static final Object KEYSTORE_LOCK = new Object();
+    private static final Map<Path, byte[]> KEK_CACHE = new ConcurrentHashMap<>();
+    private static volatile KeystoreProtectionMode lastProtectionMode;
+    private static volatile boolean forcePermissionFailureForTest = false;
 
     public record Attachment(
             long id,
@@ -439,7 +461,7 @@ public class AttachmentService {
     }
 
     /**
-     * 輪替外部 HMAC 金鑰（產生新版本 v2/v3...），保留舊版金鑰供既有憑證驗章，新上傳憑證將使用新版本金鑰。
+     * 輪替外部 HMAC 金鑰（產生新版本 v2/v3...），保留舊版金鑰供既有憑證驗章，新上傳憑證將使用新版本金鑰並保留輪替紀錄。
      */
     public String rotateHmacKey(String operator) {
         String normOp = SessionContext.resolveOperator(operator);
@@ -454,8 +476,10 @@ public class AttachmentService {
             String currentVer = props.getProperty("active_version", "v1");
             int nextNum = parseVersionNumber(currentVer) + 1;
             newVersion = "v" + nextNum;
-            props.setProperty("key." + newVersion, generateRandomHexKey());
+            props.setProperty("key." + newVersion, encryptHmacKeyHex(ksPath, generateRandomHexKey()));
             props.setProperty("active_version", newVersion);
+            props.setProperty("history." + newVersion,
+                    LocalDateTime.now() + "|operator=" + normOp + "|from=" + currentVer + "|mode=" + lastProtectionMode);
             saveKeystore(ksPath, props);
         }
         try (Connection conn = DbManager.get()) {
@@ -466,6 +490,76 @@ public class AttachmentService {
             // Best-effort audit when called outside active tenant
         }
         return newVersion;
+    }
+
+    public List<String> getKeyRotationHistory() {
+        synchronized (KEYSTORE_LOCK) {
+            Path ksPath = getKeystorePath();
+            if (!Files.exists(ksPath, LinkOption.NOFOLLOW_LINKS)) {
+                return List.of();
+            }
+            Properties props = loadKeystoreOnly(ksPath);
+            List<String> history = new ArrayList<>();
+            List<String> keys = new ArrayList<>();
+            for (String name : props.stringPropertyNames()) {
+                if (name.startsWith("history.")) keys.add(name);
+            }
+            Collections.sort(keys);
+            for (String k : keys) {
+                history.add(k.substring("history.".length()) + ": " + props.getProperty(k));
+            }
+            return history;
+        }
+    }
+
+    public static KeystoreProtectionMode getLastProtectionMode() {
+        return lastProtectionMode;
+    }
+
+    public static void setForcePermissionFailureForTest(boolean force) {
+        forcePermissionFailureForTest = force;
+    }
+
+    public static void clearInMemoryKeyCacheForTest() {
+        KEK_CACHE.clear();
+    }
+
+    public static boolean verifyKeystoreOsPermissions(Path path) {
+        if (path == null || !Files.exists(path, LinkOption.NOFOLLOW_LINKS)) return false;
+        try {
+            var posix = Files.getFileAttributeView(path, java.nio.file.attribute.PosixFileAttributeView.class,
+                    LinkOption.NOFOLLOW_LINKS);
+            if (posix != null) {
+                Set<PosixFilePermission> perms = posix.readAttributes().permissions();
+                for (PosixFilePermission p : perms) {
+                    if (p.name().startsWith("GROUP_") || p.name().startsWith("OTHERS_")) {
+                        return false;
+                    }
+                }
+                return perms.contains(PosixFilePermission.OWNER_READ);
+            }
+            AclFileAttributeView aclView = Files.getFileAttributeView(path, AclFileAttributeView.class,
+                    LinkOption.NOFOLLOW_LINKS);
+            if (aclView != null) {
+                UserPrincipal owner = aclView.getOwner();
+                List<AclEntry> acl = aclView.getAcl();
+                if (acl == null || acl.isEmpty()) return false;
+                boolean ownerFound = false;
+                for (AclEntry entry : acl) {
+                    if (entry.type() == AclEntryType.ALLOW) {
+                        if (entry.principal().equals(owner)) {
+                            ownerFound = true;
+                        } else {
+                            return false;
+                        }
+                    }
+                }
+                return ownerFound;
+            }
+            return false;
+        } catch (IOException e) {
+            return false;
+        }
     }
 
     /**
@@ -492,13 +586,14 @@ public class AttachmentService {
             Path ksPath = getKeystorePath();
             Properties props = loadOrInitKeystore(ksPath);
             String ver = props.getProperty("active_version", "v1");
-            String hex = props.getProperty("key." + ver);
-            if (hex == null || hex.isBlank()) {
-                hex = generateRandomHexKey();
-                props.setProperty("key." + ver, hex);
+            String storedVal = props.getProperty("key." + ver);
+            if (storedVal == null || storedVal.isBlank()) {
+                String hex = generateRandomHexKey();
+                props.setProperty("key." + ver, encryptHmacKeyHex(ksPath, hex));
                 saveKeystore(ksPath, props);
+                return new VersionedKey(ver, hex);
             }
-            return new VersionedKey(ver, hex);
+            return new VersionedKey(ver, decryptHmacKeyHex(ksPath, storedVal));
         }
     }
 
@@ -511,7 +606,8 @@ public class AttachmentService {
             }
             Properties props = loadKeystoreOnly(ksPath);
             String val = props.getProperty("key." + ver);
-            return (val == null || val.isBlank()) ? null : val.trim();
+            if (val == null || val.isBlank()) return null;
+            return decryptHmacKeyHex(ksPath, val.trim());
         }
     }
 
@@ -530,32 +626,94 @@ public class AttachmentService {
         if (candidate.startsWith(dataDir) || candidate.startsWith(attachDir)) {
             throw new SecurityException("HMAC 金鑰儲存位置禁止與資料庫（data/）或附件目錄（attachments/）共置: " + candidate);
         }
+        verifyKeystorePathSafety(candidate);
         return candidate;
     }
 
-    private static Properties loadOrInitKeystore(Path ksPath) {
-        if (Files.isSymbolicLink(ksPath)) {
-            throw new SecurityException("安全異常：HMAC 金鑰檔不得為符號連結: " + ksPath);
+    public static void verifyKeystorePathSafety(Path ksPath) {
+        try {
+            Path abs = ksPath.toAbsolutePath().normalize();
+            Path root = abs.getRoot();
+            if (root != null) {
+                Path curr = root;
+                for (Path segment : root.relativize(abs)) {
+                    curr = curr.resolve(segment);
+                    verifyKeystoreSingleSegment(curr);
+                }
+            }
+            Path parent = abs.getParent();
+            if (parent != null) {
+                verifyKeystoreSingleSegment(parent.resolve(".kek_store.bin"));
+                verifyKeystoreSingleSegment(parent.resolve(".kek_salt.bin"));
+            }
+        } catch (SecurityException se) {
+            throw se;
+        } catch (IOException ioe) {
+            throw new SecurityException("HMAC 金鑰路徑安全驗證失敗: " + ioe.getMessage(), ioe);
         }
+    }
+
+    private static void verifyKeystoreSingleSegment(Path p) throws IOException {
+        if (!Files.exists(p, LinkOption.NOFOLLOW_LINKS)) {
+            return;
+        }
+        if (Files.isSymbolicLink(p)) {
+            throw new SecurityException("安全異常：HMAC 金鑰路徑或父目錄不得為符號連結: " + p);
+        }
+        BasicFileAttributes attrs = Files.readAttributes(p, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+        if (attrs.isSymbolicLink() || attrs.isOther()) {
+            throw new SecurityException("安全異常：HMAC 金鑰路徑偵測到符號連結或 Windows Junction/Reparse Point: " + p);
+        }
+        Path rFollow = p.toRealPath();
+        Path rNoFollow = p.toRealPath(LinkOption.NOFOLLOW_LINKS);
+        if (!rFollow.equals(rNoFollow)) {
+            throw new SecurityException("安全異常：HMAC 金鑰實體路徑不一致: " + p);
+        }
+    }
+
+    private static Properties loadOrInitKeystore(Path ksPath) {
+        verifyKeystorePathSafety(ksPath);
         Properties props = Files.exists(ksPath, LinkOption.NOFOLLOW_LINKS)
                 ? loadKeystoreOnly(ksPath)
                 : new Properties();
+        boolean dirty = false;
         if (!props.containsKey("active_version") || !props.containsKey("key." + props.getProperty("active_version"))) {
             String ver = props.getProperty("active_version", "v1");
             props.setProperty("active_version", ver);
-            props.setProperty("key." + ver, generateRandomHexKey());
+            props.setProperty("key." + ver, encryptHmacKeyHex(ksPath, generateRandomHexKey()));
+            props.setProperty("history." + ver, LocalDateTime.now() + "|init|mode=" + lastProtectionMode);
+            dirty = true;
+        }
+        // Upgrade any legacy plaintext hex entries from R12 to ENCv1 ciphertext
+        for (String name : props.stringPropertyNames()) {
+            if (name.startsWith("key.")) {
+                String v = props.getProperty(name);
+                if (v != null && !v.startsWith(ENC_PREFIX)) {
+                    props.setProperty(name, encryptHmacKeyHex(ksPath, v.trim()));
+                    dirty = true;
+                }
+            }
+        }
+        if (dirty) {
             saveKeystore(ksPath, props);
         }
         return props;
     }
 
     private static Properties loadKeystoreOnly(Path ksPath) {
-        if (Files.isSymbolicLink(ksPath)) {
-            throw new SecurityException("安全異常：HMAC 金鑰檔不得為符號連結: " + ksPath);
-        }
+        verifyKeystorePathSafety(ksPath);
         Properties props = new Properties();
-        try (InputStream in = Files.newInputStream(ksPath, LinkOption.NOFOLLOW_LINKS)) {
-            props.load(in);
+        try {
+            Path expectedReal = ksPath.toRealPath(LinkOption.NOFOLLOW_LINKS);
+            try (InputStream in = Files.newInputStream(ksPath, LinkOption.NOFOLLOW_LINKS)) {
+                props.load(in);
+            }
+            Path afterReal = ksPath.toRealPath(LinkOption.NOFOLLOW_LINKS);
+            if (!expectedReal.equals(afterReal)) {
+                throw new SecurityException("偵測到 HMAC 金鑰檔於讀取期間遭到替換（TOCTOU）: " + ksPath);
+            }
+        } catch (SecurityException se) {
+            throw se;
         } catch (IOException e) {
             throw new BusinessException("讀取外部 HMAC 金鑰儲存失敗: " + e.getMessage(), e);
         }
@@ -563,35 +721,218 @@ public class AttachmentService {
     }
 
     private static void saveKeystore(Path ksPath, Properties props) {
+        verifyKeystorePathSafety(ksPath);
         try {
             Path parent = ksPath.getParent();
             if (parent != null && !Files.exists(parent, LinkOption.NOFOLLOW_LINKS)) {
                 Files.createDirectories(parent);
                 hardenFilePermissions(parent, true);
             }
-            if (Files.isSymbolicLink(ksPath)) {
-                throw new SecurityException("安全異常：HMAC 金鑰檔不得為符號連結");
+            verifyKeystorePathSafety(ksPath);
+            Path tmp = ksPath.resolveSibling(ksPath.getFileName().toString() + ".tmp");
+            if (Files.isSymbolicLink(tmp)) {
+                throw new SecurityException("安全異常：HMAC 暫存檔不得為符號連結");
             }
-            try (OutputStream out = Files.newOutputStream(ksPath)) {
-                props.store(out, "JAVA-FINAL External Attachment HMAC Keystore (DO NOT STORE IN SQLITE)");
+            try {
+                try (OutputStream out = Files.newOutputStream(tmp)) {
+                    props.store(out, "JAVA-FINAL External Encrypted Attachment HMAC Keystore (DO NOT STORE IN SQLITE)");
+                }
+                hardenFilePermissions(tmp, false);
+                verifyKeystorePathSafety(ksPath);
+                Files.move(tmp, ksPath, StandardCopyOption.REPLACE_EXISTING);
+                hardenFilePermissions(ksPath, false);
+                verifyKeystorePathSafety(ksPath);
+            } finally {
+                Files.deleteIfExists(tmp);
             }
-            hardenFilePermissions(ksPath, false);
+        } catch (SecurityException se) {
+            throw se;
         } catch (IOException e) {
             throw new BusinessException("寫入外部 HMAC 金鑰儲存失敗: " + e.getMessage(), e);
         }
     }
 
-    private static void hardenFilePermissions(Path path, boolean isDir) {
+    private static byte[] getOrCreateKek(Path ksPath) {
         try {
-            var posix = Files.getFileAttributeView(path, java.nio.file.attribute.PosixFileAttributeView.class);
+            Path parent = ksPath.getParent();
+            if (parent == null) {
+                throw new SecurityException("無效的 HMAC 金鑰父目錄");
+            }
+            if (!Files.exists(parent, LinkOption.NOFOLLOW_LINKS)) {
+                Files.createDirectories(parent);
+                hardenFilePermissions(parent, true);
+            }
+            verifyKeystorePathSafety(ksPath);
+            Path realParent = parent.toRealPath(LinkOption.NOFOLLOW_LINKS);
+            byte[] cached = KEK_CACHE.get(realParent);
+            if (cached != null) {
+                return cached;
+            }
+            Path kekFile = realParent.resolve(".kek_store.bin");
+            verifyKeystoreSingleSegment(kekFile);
+
+            boolean forceFallback = Boolean.getBoolean(FORCE_FALLBACK_PROP);
+            boolean isWindows = System.getProperty("os.name", "").toLowerCase().contains("win");
+
+            if (Files.exists(kekFile, LinkOption.NOFOLLOW_LINKS)) {
+                String content = Files.readString(kekFile, StandardCharsets.UTF_8).trim();
+                byte[] kek;
+                if (content.startsWith("DPAPI:")) {
+                    kek = unprotectWithWindowsDpapi(content.substring("DPAPI:".length()));
+                    lastProtectionMode = KeystoreProtectionMode.WINDOWS_DPAPI_AES256_GCM;
+                } else if (content.startsWith("PBKDF2")) {
+                    kek = deriveFallbackKek(realParent, false);
+                    lastProtectionMode = KeystoreProtectionMode.FALLBACK_PBKDF2_AES256_GCM_OS_ACL;
+                } else {
+                    throw new SecurityException("無法識別的 HMAC 主金鑰儲存格式");
+                }
+                KEK_CACHE.put(realParent, kek);
+                return kek;
+            }
+
+            if (isWindows && !forceFallback) {
+                try {
+                    byte[] rawKek = new byte[32];
+                    new SecureRandom().nextBytes(rawKek);
+                    String dpapiBlob = protectWithWindowsDpapi(rawKek);
+                    Files.writeString(kekFile, "DPAPI:" + dpapiBlob, StandardCharsets.UTF_8);
+                    hardenFilePermissions(kekFile, false);
+                    lastProtectionMode = KeystoreProtectionMode.WINDOWS_DPAPI_AES256_GCM;
+                    KEK_CACHE.put(realParent, rawKek);
+                    return rawKek;
+                } catch (Exception dpapiErr) {
+                    LOG.warning("Windows DPAPI 保護暫時無法使用，改採安全降級模式 PBKDF2+OS-ACL: " + dpapiErr.getMessage());
+                }
+            }
+
+            byte[] fallbackKek = deriveFallbackKek(realParent, true);
+            Files.writeString(kekFile, "PBKDF2", StandardCharsets.UTF_8);
+            hardenFilePermissions(kekFile, false);
+            lastProtectionMode = KeystoreProtectionMode.FALLBACK_PBKDF2_AES256_GCM_OS_ACL;
+            KEK_CACHE.put(realParent, fallbackKek);
+            return fallbackKek;
+        } catch (SecurityException se) {
+            throw se;
+        } catch (Exception e) {
+            throw new SecurityException("HMAC 主金鑰準備失敗: " + e.getMessage(), e);
+        }
+    }
+
+    private static byte[] deriveFallbackKek(Path realParent, boolean createSaltIfMissing) throws Exception {
+        Path saltFile = realParent.resolve(".kek_salt.bin");
+        verifyKeystoreSingleSegment(saltFile);
+        byte[] salt;
+        if (Files.exists(saltFile, LinkOption.NOFOLLOW_LINKS)) {
+            salt = Files.readAllBytes(saltFile);
+        } else if (createSaltIfMissing) {
+            salt = new byte[32];
+            new SecureRandom().nextBytes(salt);
+            Files.write(saltFile, salt);
+            hardenFilePermissions(saltFile, false);
+        } else {
+            throw new SecurityException("缺少降級模式金鑰鹽值檔: " + saltFile);
+        }
+        String material = System.getProperty("user.name", "ledger") + "|" + realParent.toString();
+        PBEKeySpec spec = new PBEKeySpec(material.toCharArray(), salt, 120_000, 256);
+        SecretKeyFactory skf = SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256");
+        return skf.generateSecret(spec).getEncoded();
+    }
+
+    private static String protectWithWindowsDpapi(byte[] rawKek) throws Exception {
+        ProcessBuilder pb = new ProcessBuilder(
+                "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                "Add-Type -AssemblyName System.Security; " +
+                "$b=[Convert]::FromBase64String($env:LEDGER_KEK_PLAIN); " +
+                "$p=[System.Security.Cryptography.ProtectedData]::Protect($b,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser); " +
+                "[Convert]::ToBase64String($p)");
+        pb.environment().put("LEDGER_KEK_PLAIN", Base64.getEncoder().encodeToString(rawKek));
+        pb.redirectErrorStream(true);
+        Process p = pb.start();
+        String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+        int code = p.waitFor();
+        if (code != 0 || out.isEmpty()) {
+            throw new IOException("PowerShell DPAPI Protect failed (exit=" + code + "): " + out);
+        }
+        String[] lines = out.split("\\R");
+        return lines[lines.length - 1].trim();
+    }
+
+    private static byte[] unprotectWithWindowsDpapi(String dpapiBase64) throws Exception {
+        ProcessBuilder pb = new ProcessBuilder(
+                "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                "Add-Type -AssemblyName System.Security; " +
+                "$p=[Convert]::FromBase64String($env:LEDGER_KEK_BLOB); " +
+                "$b=[System.Security.Cryptography.ProtectedData]::Unprotect($p,$null,[System.Security.Cryptography.DataProtectionScope]::CurrentUser); " +
+                "[Convert]::ToBase64String($b)");
+        pb.environment().put("LEDGER_KEK_BLOB", dpapiBase64.trim());
+        pb.redirectErrorStream(true);
+        Process p = pb.start();
+        String out = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8).trim();
+        int code = p.waitFor();
+        if (code != 0 || out.isEmpty()) {
+            throw new IOException("PowerShell DPAPI Unprotect failed (exit=" + code + "): " + out);
+        }
+        String[] lines = out.split("\\R");
+        return Base64.getDecoder().decode(lines[lines.length - 1].trim());
+    }
+
+    private static String encryptHmacKeyHex(Path ksPath, String hexKey) {
+        try {
+            byte[] kek = getOrCreateKek(ksPath);
+            byte[] iv = new byte[12];
+            new SecureRandom().nextBytes(iv);
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(kek, "AES"), new GCMParameterSpec(128, iv));
+            byte[] ct = cipher.doFinal(HexFormat.of().parseHex(hexKey));
+            return ENC_PREFIX + HexFormat.of().formatHex(iv) + ":" + HexFormat.of().formatHex(ct);
+        } catch (Exception e) {
+            throw new BusinessException("加密 HMAC 金鑰失敗: " + e.getMessage(), e);
+        }
+    }
+
+    private static String decryptHmacKeyHex(Path ksPath, String storedValue) {
+        if (!storedValue.startsWith(ENC_PREFIX)) {
+            return storedValue; // Backward-compatible read before re-encryption upgrade
+        }
+        try {
+            String rest = storedValue.substring(ENC_PREFIX.length());
+            int sep = rest.indexOf(':');
+            if (sep <= 0) {
+                throw new SecurityException("已毀損的加密金鑰格式");
+            }
+            byte[] iv = HexFormat.of().parseHex(rest.substring(0, sep));
+            byte[] ct = HexFormat.of().parseHex(rest.substring(sep + 1));
+            byte[] kek = getOrCreateKek(ksPath);
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(kek, "AES"), new GCMParameterSpec(128, iv));
+            byte[] plain = cipher.doFinal(ct);
+            return HexFormat.of().formatHex(plain);
+        } catch (SecurityException se) {
+            throw se;
+        } catch (Exception e) {
+            throw new SecurityException("解密外部 HMAC 金鑰失敗: " + e.getMessage(), e);
+        }
+    }
+
+    private static void hardenFilePermissions(Path path, boolean isDir) {
+        if (forcePermissionFailureForTest) {
+            throw new SecurityException("模擬作業系統檔案權限設定失敗，拒絕略過安全保護: " + path);
+        }
+        try {
+            var posix = Files.getFileAttributeView(path, java.nio.file.attribute.PosixFileAttributeView.class,
+                    LinkOption.NOFOLLOW_LINKS);
             if (posix != null) {
                 Set<PosixFilePermission> perms = isDir
                         ? EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE)
                         : EnumSet.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE);
                 Files.setPosixFilePermissions(path, perms);
+                if (!verifyKeystoreOsPermissions(path)) {
+                    throw new SecurityException("POSIX 權限驗證未通過: " + path);
+                }
                 return;
             }
-            AclFileAttributeView aclView = Files.getFileAttributeView(path, AclFileAttributeView.class);
+            AclFileAttributeView aclView = Files.getFileAttributeView(path, AclFileAttributeView.class,
+                    LinkOption.NOFOLLOW_LINKS);
             if (aclView != null) {
                 UserPrincipal owner = aclView.getOwner();
                 AclEntry entry = AclEntry.newBuilder()
@@ -600,9 +941,16 @@ public class AttachmentService {
                         .setPermissions(EnumSet.allOf(AclEntryPermission.class))
                         .build();
                 aclView.setAcl(List.of(entry));
+                if (!verifyKeystoreOsPermissions(path)) {
+                    throw new SecurityException("Windows ACL 權限驗證未通過: " + path);
+                }
+                return;
             }
-        } catch (Exception ignored) {
-            // Fallback best-effort when running on restricted virtual filesystems
+            throw new SecurityException("系統不支援 POSIX 或 Windows ACL 權限控管，無法確保金鑰安全: " + path);
+        } catch (SecurityException se) {
+            throw se;
+        } catch (Exception e) {
+            throw new SecurityException("設定 HMAC 金鑰安全權限失敗，禁止靜默略過: " + e.getMessage(), e);
         }
     }
 

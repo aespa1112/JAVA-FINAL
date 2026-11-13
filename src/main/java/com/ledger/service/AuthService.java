@@ -23,18 +23,21 @@ public class AuthService {
         private final String displayName;
         private final OperatorRole role;
         private final boolean enabled;
+        private final long epoch;
 
-        private SessionToken(String username, String displayName, OperatorRole role, boolean enabled) {
+        private SessionToken(String username, String displayName, OperatorRole role, boolean enabled, long epoch) {
             this.username = username;
             this.displayName = displayName;
             this.role = role;
             this.enabled = enabled;
+            this.epoch = epoch;
         }
 
         public String username() { return username; }
         public String displayName() { return displayName; }
         public OperatorRole role() { return role; }
         public boolean enabled() { return enabled; }
+        public long epoch() { return epoch; }
     }
 
     public record UserAccount(String username, String displayName, OperatorRole role, boolean enabled) {}
@@ -183,6 +186,7 @@ public class AuthService {
             if (username == null || username.isBlank()) throw new BusinessException("請輸入帳號");
             if (password == null || password.isEmpty()) throw new BusinessException("請輸入密碼");
             String key = username.trim().toLowerCase();
+            long preEpoch = SessionContext.getUserRevocationEpoch(key);
 
             int maxRetries = 10;
             for (int retry = 0; retry < maxRetries; retry++) {
@@ -279,7 +283,13 @@ public class AuthService {
                                 } catch (BusinessException ignored) {
                                     canonical = rawUser;
                                 }
-                                SessionContext.establishSession(new SessionToken(canonical, displayName, role, isEnabled));
+                                synchronized (SessionContext.getSessionStateLock()) {
+                                    if (!isEnabled || !isEnabled(rawUser) || SessionContext.isUserRevoked(canonical)) {
+                                        throw new BusinessException("此帳號已停用或憑證已撤銷，禁止登入");
+                                    }
+                                    SessionContext.establishSession(
+                                            new SessionToken(canonical, displayName, role, true, preEpoch));
+                                }
                                 auditAuth("LOGIN_OK", canonical, "success");
                                 return rawUser;
                             }
@@ -424,28 +434,32 @@ public class AuthService {
     }
 
     public void setEnabled(String username, boolean enabled, String operator) {
-        requireAdmin(operator);
-        if (username == null) throw new BusinessException("請指定帳號");
-        String user = username.trim().toLowerCase();
-        if ("admin".equals(user) && !enabled) throw new BusinessException("不可停用內建管理員 admin");
-        try (Connection conn = open();
-             PreparedStatement ps = conn.prepareStatement(
-                     "UPDATE users SET enabled = ? WHERE lower(username) = ?")) {
-            ps.setInt(1, enabled ? 1 : 0);
-            ps.setString(2, user);
-            if (ps.executeUpdate() == 0) throw new BusinessException("找不到帳號: " + user);
-            if (!enabled) {
-                OperatorRole.unregister(user);
-                SessionContext.invalidateUserSessions(user);
-            } else {
-                SessionContext.clearUserRevocation(user);
-                UserAccount acc = getAccount(user);
-                if (acc != null) OperatorRole.register(user, acc.role());
+        synchronized (AUTH_LOCK) {
+            requireAdmin(operator);
+            if (username == null) throw new BusinessException("請指定帳號");
+            String user = username.trim().toLowerCase();
+            if ("admin".equals(user) && !enabled) throw new BusinessException("不可停用內建管理員 admin");
+            try (Connection conn = open();
+                 PreparedStatement ps = conn.prepareStatement(
+                         "UPDATE users SET enabled = ? WHERE lower(username) = ?")) {
+                ps.setInt(1, enabled ? 1 : 0);
+                ps.setString(2, user);
+                if (ps.executeUpdate() == 0) throw new BusinessException("找不到帳號: " + user);
+                synchronized (SessionContext.getSessionStateLock()) {
+                    if (!enabled) {
+                        OperatorRole.unregister(user);
+                        SessionContext.invalidateUserSessions(user);
+                    } else {
+                        SessionContext.clearUserRevocation(user);
+                        UserAccount acc = getAccount(user);
+                        if (acc != null) OperatorRole.register(user, acc.role());
+                    }
+                }
+            } catch (BusinessException e) {
+                throw e;
+            } catch (SQLException e) {
+                throw new BusinessException("更新啟用狀態失敗: " + e.getMessage(), e);
             }
-        } catch (BusinessException e) {
-            throw e;
-        } catch (SQLException e) {
-            throw new BusinessException("更新啟用狀態失敗: " + e.getMessage(), e);
         }
     }
 

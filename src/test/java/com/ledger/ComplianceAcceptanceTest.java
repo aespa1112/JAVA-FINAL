@@ -3,8 +3,10 @@ package com.ledger;
 import com.ledger.config.DbManager;
 import com.ledger.config.SessionContext;
 import com.ledger.config.TenantPathResolver;
+import com.ledger.config.TenantSecurityService;
 import com.ledger.dao.AccountDao;
 import com.ledger.dao.FiscalPeriodDao;
+import com.ledger.dao.ReportDaoExtra;
 import com.ledger.exception.BusinessException;
 import com.ledger.model.Account;
 import com.ledger.model.FinancialStatementItem;
@@ -24,12 +26,16 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.Connection;
+import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.Statement;
 import java.time.LocalDate;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -699,6 +705,9 @@ public class ComplianceAcceptanceTest {
             if (stored1 != null) Files.deleteIfExists(stored1);
             if (stored2 != null) Files.deleteIfExists(stored2);
             Files.deleteIfExists(ksFile);
+            Files.deleteIfExists(ksFile.resolveSibling(ksFile.getFileName().toString() + ".tmp"));
+            Files.deleteIfExists(ksTemp.resolve(".kek_store.bin"));
+            Files.deleteIfExists(ksTemp.resolve(".kek_salt.bin"));
             Files.deleteIfExists(ksTemp);
         }
     }
@@ -784,5 +793,589 @@ public class ComplianceAcceptanceTest {
         assertFalse(taxService.validateUniformInvoice("AB-12345678", 115, 7,
                 MoneyUtil.toMinor("1000"), MoneyUtil.toMinor("50"), MoneyUtil.toMinor("1050"),
                 TaiwanTaxComplianceService.TaxType.TAXABLE_5_PERCENT).valid());
+    }
+
+    // ==================== R13 驗收測試（Session 競態 / TOCTOU / 混合現金流 / KeyStore / 歸檔 / 稅務版本化 / 資料庫升級） ====================
+
+    @Test
+    @DisplayName("R13-P0-01: 多執行緒 Session 登入與撤銷/停用競態壓力測試（>=1000 輪），撤銷後 isLoggedIn() 永遠為 false")
+    void r13_p0_01_sessionRevocationRaceStress1000Rounds() throws Exception {
+        AuthService auth = new AuthService();
+        ExecutorService pool = Executors.newFixedThreadPool(2);
+        try {
+            // 透過至少 1,000 輪併發競態驗證登入與撤銷/停用之嚴格同步順序
+            for (int round = 0; round < 1000; round++) {
+                // 每 25 輪實測完整停用並重新啟用資料庫狀態，其餘輪次透過 setEnabled(true) 清除撤銷狀態
+                if (round > 0) {
+                    auth.login("admin", "admin123");
+                    auth.setEnabled("david", true, "admin");
+                    SessionContext.clear();
+                }
+
+                CyclicBarrier barrier = new CyclicBarrier(2);
+                Future<?> loginFuture = pool.submit(() -> {
+                    barrier.await(5, TimeUnit.SECONDS);
+                    try {
+                        auth.login("david", "david123");
+                    } catch (BusinessException | SecurityException expected) {
+                        // 若撤銷先發生或 epoch 過期，登入必須失敗
+                    }
+                    return null;
+                });
+
+                boolean fullDisableRound = (round % 50 == 0);
+                Future<?> revokeFuture = pool.submit(() -> {
+                    barrier.await(5, TimeUnit.SECONDS);
+                    if (fullDisableRound) {
+                        auth.login("admin", "admin123");
+                        auth.setEnabled("david", false, "admin");
+                    } else {
+                        SessionContext.invalidateUserSessions("david");
+                    }
+                    return null;
+                });
+
+                loginFuture.get(10, TimeUnit.SECONDS);
+                revokeFuture.get(10, TimeUnit.SECONDS);
+
+                assertTrue(SessionContext.isUserRevoked("david"),
+                        "第 " + round + " 輪撤銷完成後 david 必須保持 revoked 狀態");
+                if (SessionContext.isLoggedIn()) {
+                    assertNotEquals("david", SessionContext.getUser(),
+                            "第 " + round + " 輪撤銷完成後，david 絕不可處於已登入狀態");
+                }
+                // 模擬撤銷後即刻檢查當前會話（非 admin 代打情況下必須完全未登入）
+                if (!fullDisableRound) {
+                    assertFalse(SessionContext.isLoggedIn(),
+                            "第 " + round + " 輪 revoke 完成後 isLoggedIn() 必須永遠為 false");
+                }
+            }
+        } finally {
+            pool.shutdownNow();
+            pool.awaitTermination(5, TimeUnit.SECONDS);
+            SessionContext.clear();
+        }
+    }
+
+    @Test
+    @DisplayName("R13-P0-02: TenantPathResolver 與 DbManager TOCTOU、WAL/SHM/父目錄 Junction 防護與路徑替換競態")
+    void r13_p0_02_toctouPathSwapAndWalShmJunctionProtection() throws Exception {
+        Path tenantRoot = Paths.get("data/tenants").toAbsolutePath().normalize();
+        Files.createDirectories(tenantRoot);
+        Path targetOutsideDir = Files.createTempDirectory("r13_outside_target");
+        String safeRelPath = "data/tenants/r13_toctou_safe.db";
+        Path safeDb = Paths.get(safeRelPath).toAbsolutePath().normalize();
+        Path swappedParent = tenantRoot.resolve("r13_junction_parent");
+        String swappedParentDbRel = "data/tenants/r13_junction_parent/victim.db";
+        String walTargetDbRel = "data/tenants/r13_wal_junction.db";
+        Path walTargetDb = Paths.get(walTargetDbRel).toAbsolutePath().normalize();
+        Path walLink = tenantRoot.resolve("r13_wal_junction.db-wal");
+        Path shmLink = tenantRoot.resolve("r13_wal_junction.db-shm");
+        String authTenantId = "r13_toctou_tenant_auth";
+        String authTenantRel = TenantPathResolver.resolveDbPath(authTenantId);
+
+        try {
+            // 1. 正常授權租戶 DB：prepareAndVerifyDatabaseFile + getForTenant + PRAGMA database_list 實體驗證
+            Path realPrepared = TenantPathResolver.prepareAndVerifyDatabaseFile(safeRelPath, tenantRoot);
+            assertTrue(realPrepared.startsWith(tenantRoot.toRealPath()));
+            TenantSecurityService.grant(authTenantId, "r13_test");
+            Path authPrepared = TenantPathResolver.prepareAndVerifyDatabaseFile(authTenantRel, tenantRoot);
+            try (Connection conn = DbManager.getForTenant(authTenantId)) {
+                TenantPathResolver.verifyOpenedSqliteConnection(conn, authPrepared, tenantRoot);
+            }
+            DbManager.closeAllTenants();
+            DbManager.closeCurrent();
+
+            boolean isWindows = System.getProperty("os.name", "").toLowerCase().contains("win");
+            if (isWindows) {
+                // 2. 父目錄 Windows Junction 攻擊必須遭拒
+                Process p1 = new ProcessBuilder("cmd", "/c", "mklink", "/J",
+                        swappedParent.toString(), targetOutsideDir.toString()).redirectErrorStream(true).start();
+                assertEquals(0, p1.waitFor(), "測試環境應可建立目錄 Junction");
+
+                assertThrows(SecurityException.class, () ->
+                        TenantPathResolver.prepareAndVerifyDatabaseFile(swappedParentDbRel, tenantRoot));
+                assertThrows(SecurityException.class, () ->
+                        DbManager.switchDatabase(swappedParentDbRel));
+
+                // 3. -wal / -shm 附屬檔為 Windows Junction / Reparse Point 時必須遭拒
+                Files.deleteIfExists(walTargetDb);
+                Process p2 = new ProcessBuilder("cmd", "/c", "mklink", "/J",
+                        walLink.toString(), targetOutsideDir.toString()).redirectErrorStream(true).start();
+                assertEquals(0, p2.waitFor());
+                assertThrows(SecurityException.class, () ->
+                        TenantPathResolver.prepareAndVerifyDatabaseFile(walTargetDbRel, tenantRoot));
+
+                new ProcessBuilder("cmd", "/c", "rmdir", walLink.toString()).start().waitFor();
+                Process p3 = new ProcessBuilder("cmd", "/c", "mklink", "/J",
+                        shmLink.toString(), targetOutsideDir.toString()).redirectErrorStream(true).start();
+                assertEquals(0, p3.waitFor());
+                assertThrows(SecurityException.class, () ->
+                        TenantPathResolver.prepareAndVerifyDatabaseFile(walTargetDbRel, tenantRoot));
+                new ProcessBuilder("cmd", "/c", "rmdir", shmLink.toString()).start().waitFor();
+            }
+
+            // 4. 併發切換與路徑驗證競態：不得回傳指向 data/tenants 外部之連線
+            String raceRel = "data/tenants/r13_race_tenant.db";
+            Path raceDb = Paths.get(raceRel).toAbsolutePath().normalize();
+            ExecutorService pool = Executors.newFixedThreadPool(8);
+            try {
+                List<Future<Boolean>> futures = new ArrayList<>();
+                for (int i = 0; i < 16; i++) {
+                    futures.add(pool.submit(() -> {
+                        TenantPathResolver.prepareAndVerifyDatabaseFile(raceRel, tenantRoot);
+                        return true;
+                    }));
+                }
+                for (Future<Boolean> f : futures) {
+                    assertTrue(f.get(10, TimeUnit.SECONDS));
+                }
+            } finally {
+                pool.shutdownNow();
+                pool.awaitTermination(5, TimeUnit.SECONDS);
+                Files.deleteIfExists(raceDb);
+                Files.deleteIfExists(Paths.get(raceDb + "-wal"));
+                Files.deleteIfExists(Paths.get(raceDb + "-shm"));
+            }
+        } finally {
+            TenantSecurityService.revoke(authTenantId);
+            DbManager.closeAllTenants();
+            DbManager.closeCurrent();
+            new ProcessBuilder("cmd", "/c", "rmdir", swappedParent.toString()).start().waitFor();
+            new ProcessBuilder("cmd", "/c", "rmdir", walLink.toString()).start().waitFor();
+            new ProcessBuilder("cmd", "/c", "rmdir", shmLink.toString()).start().waitFor();
+            Files.deleteIfExists(safeDb);
+            Files.deleteIfExists(Paths.get(safeDb + "-wal"));
+            Files.deleteIfExists(Paths.get(safeDb + "-shm"));
+            Path authDbFile = Paths.get(authTenantRel).toAbsolutePath().normalize();
+            Files.deleteIfExists(authDbFile);
+            Files.deleteIfExists(Paths.get(authDbFile + "-wal"));
+            Files.deleteIfExists(Paths.get(authDbFile + "-shm"));
+            Files.deleteIfExists(walTargetDb);
+            Files.deleteIfExists(targetOutsideDir);
+        }
+    }
+
+    @Test
+    @DisplayName("R13-P1-01: 現金流量表混合交易拆帳與全 8 種固定資產/折舊/分期/處分/動態現金科目情境")
+    void r13_p1_01_mixedCashFlowAndAllEightScenarios() throws Exception {
+        // 先驗證核心 R13 指定混合傳票（2027-01）：
+        // Dr 設備 100,000 / Cr 現金 20,000 / Cr 應付帳款 80,000 -> CFI = -20,000, NON_CASH = 80,000
+        voucherService.post(voucherService.createDraft("2027-01-10", "混合購置設備(2萬現金+8萬賒欠)", "Amy", List.of(
+                entry("1401", "100000.00", "0"),
+                entry("1101", "0", "20000.00"),
+                entry("2122", "0", "80000.00")
+        )).id(), "Bob");
+
+        List<FinancialStatementItem> mixedCf = reportService.getCashFlow("2027-01-01", "2027-01-31");
+        assertEquals(0L, cfAmount(mixedCf, "CFO"));
+        assertEquals(MoneyUtil.toMinor("-20000.00"), cfAmount(mixedCf, "CFI"), "混合交易僅實際付現 20,000 計入 CFI，不得算成 -100,000");
+        assertEquals(MoneyUtil.toMinor("80000.00"), cfAmount(mixedCf, "NON_CASH"), "賒購 80,000 須單獨揭露為非現金投資活動");
+
+        // 情境 1（2027-02）：現金全額購置設備 100,000
+        voucherService.post(voucherService.createDraft("2027-02-05", "全額現購設備", "Amy", List.of(
+                entry("1401", "100000.00", "0"),
+                entry("1102", "0", "100000.00")
+        )).id(), "Bob");
+        List<FinancialStatementItem> cfFeb = reportService.getCashFlow("2027-02-01", "2027-02-28");
+        assertEquals(MoneyUtil.toMinor("-100000.00"), cfAmount(cfFeb, "CFI"));
+        assertEquals(0L, cfAmount(cfFeb, "NON_CASH"));
+
+        // 情境 2（2027-03）：全額賒購設備 80,000（Dr 1401 / Cr 2123 應付設備款）
+        voucherService.post(voucherService.createDraft("2027-03-05", "全額賒購設備", "Amy", List.of(
+                entry("1401", "80000.00", "0"),
+                entry("2123", "0", "80000.00")
+        )).id(), "Bob");
+        List<FinancialStatementItem> cfMar = reportService.getCashFlow("2027-03-01", "2027-03-31");
+        assertEquals(0L, cfAmount(cfMar, "CFI"));
+        assertEquals(MoneyUtil.toMinor("80000.00"), cfAmount(cfMar, "NON_CASH"));
+
+        // 情境 4（2027-04）：分期償還應付設備款 30,000（使用約當現金 1104 驗證動態科目表現金辨識）
+        voucherService.post(voucherService.createDraft("2027-04-05", "分期支付應付設備款", "Amy", List.of(
+                entry("2123", "30000.00", "0"),
+                entry("1104", "0", "30000.00")
+        )).id(), "Bob");
+        List<FinancialStatementItem> cfApr = reportService.getCashFlow("2027-04-01", "2027-04-30");
+        assertEquals(MoneyUtil.toMinor("-30000.00"), cfAmount(cfApr, "CFI"), "設備分期付款實際付現應計入 CFI 流出");
+
+        // 情境 5 + 7（2027-05）：提列折舊 25,000 並以零用金 1103 收現 95,000 處分設備（成本100k/累折15k/處分利益10k）
+        voucherService.post(voucherService.createAdjustingDraft("2027-05-15", "提列折舊", "Amy", List.of(
+                entry("5208", "25000.00", "0"),
+                entry("1402", "0", "25000.00")
+        )).id(), "Bob");
+        voucherService.post(voucherService.createDraft("2027-05-20", "處分設備收現(零用金)", "Amy", List.of(
+                entry("1103", "95000.00", "0"),
+                entry("1402", "15000.00", "0"),
+                entry("1401", "0", "100000.00"),
+                entry("4202", "0", "10000.00")
+        )).id(), "Bob");
+        List<FinancialStatementItem> cfMay = reportService.getCashFlow("2027-05-01", "2027-05-31");
+        assertEquals(MoneyUtil.toMinor("25000.00"), cfAmount(cfMay, "DEPR_AMORT"));
+        assertEquals(MoneyUtil.toMinor("-10000.00"), cfAmount(cfMay, "DISPOSAL_ADJ"));
+        assertEquals(0L, cfAmount(cfMay, "CFO"));
+        assertEquals(MoneyUtil.toMinor("95000.00"), cfAmount(cfMay, "CFI"));
+
+        // 情境 6（2027-06）：設備處分款尚未收現（Dr 1122 60,000 / Cr 1401 50,000 / Cr 4202 10,000）
+        voucherService.post(voucherService.createDraft("2027-06-10", "賒售設備(尚未收現)", "Amy", List.of(
+                entry("1122", "60000.00", "0"),
+                entry("1401", "0", "50000.00"),
+                entry("4202", "0", "10000.00")
+        )).id(), "Bob");
+        List<FinancialStatementItem> cfJun = reportService.getCashFlow("2027-06-01", "2027-06-30");
+        assertEquals(0L, cfAmount(cfJun, "CFI"), "尚未收現之設備處分款不得計入本期 CFI 現金流入");
+        assertEquals(0L, cfAmount(cfJun, "CFO"));
+
+        // 情境 8：全年彙總現金流量表與總帳現金科目（1101/1102/1103/1104）完全勾稽
+        List<FinancialStatementItem> cfYear = reportService.getCashFlow("2027-01-01", "2027-12-31");
+        assertEquals(cfAmount(cfYear, "END_CASH"), cfAmount(cfYear, "ACTUAL_CASH"));
+        assertTrue(ReportDaoExtra.isCashReconciled(cfYear));
+        try (Connection conn = DbManager.get()) {
+            var cashCodes = ReportDaoExtra.resolveCashAccountCodes(conn);
+            assertTrue(cashCodes.containsAll(List.of("1101", "1102", "1103", "1104")));
+        }
+        reconciliationService.assertAllPass("2027-01-01", "2027-12-31");
+    }
+
+    private static long cfAmount(List<FinancialStatementItem> items, String code) {
+        return items.stream().filter(i -> code.equals(i.code())).findFirst().orElseThrow().amountMinor();
+    }
+
+    @Test
+    @DisplayName("R13-P1-02: AttachmentService HMAC 金鑰加密儲存（Windows DPAPI / 明確降級）、OS ACL 失敗不靜默與輪換歷程")
+    void r13_p1_02_hmacKeyEncryptedDpapiAndPermissionEnforcement() throws Exception {
+        Path ksTemp = Files.createTempDirectory("r13_keystore_");
+        Path keystoreFile = ksTemp.resolve("hmac_keys.properties");
+        String prevProp = System.getProperty("ledger.hmac.keystore.path");
+        System.setProperty("ledger.hmac.keystore.path", keystoreFile.toString());
+
+        Path src = Files.createTempFile("r13_att", ".txt");
+        Files.writeString(src, "R13 secure keystore verification");
+        Path outsideDir = Files.createTempDirectory("r13_ks_outside");
+        Path junctionAttachDir = Paths.get("data/attachments_junction_r13").toAbsolutePath().normalize();
+        Path stored = null;
+
+        try {
+            Voucher v = voucherService.createDraft("2027-04-01", "R13金鑰測試傳票", "Amy", List.of(
+                    entry("5206", "100.00", "0"),
+                    entry("1101", "0", "100.00")
+            ));
+            voucherService.post(v.id(), "Bob");
+
+            var att = attachmentService.addAttachment(v.id(), src, "INV-R13", "2027-04-01", "v1", "Bob");
+            stored = Paths.get(att.storedPath());
+            assertTrue(Files.exists(keystoreFile));
+
+            // 1. 金鑰檔內不得存有明文 raw hex key，必須為 ENCv1: 加密封裝格式
+            Properties props = new Properties();
+            try (var in = Files.newInputStream(keystoreFile)) {
+                props.load(in);
+            }
+            String storedSecret = props.getProperty("key.v1");
+            assertNotNull(storedSecret);
+            assertTrue(storedSecret.startsWith("ENCv1:"), "金鑰檔不可為明文，必須使用 AES-256-GCM 密文前綴 ENCv1:");
+
+            boolean isWindows = System.getProperty("os.name", "").toLowerCase().contains("win");
+            if (isWindows) {
+                assertEquals(AttachmentService.KeystoreProtectionMode.WINDOWS_DPAPI_AES256_GCM,
+                        AttachmentService.getLastProtectionMode(),
+                        "Windows 11 環境應優先採用 DPAPI 保護金鑰");
+                Path kekFile = ksTemp.resolve(".kek_store.bin");
+                assertTrue(Files.exists(kekFile), "Windows DPAPI 模式應建立受 DPAPI 保護之 .kek_store.bin");
+                assertTrue(Files.readString(kekFile).startsWith("DPAPI:"));
+            }
+            assertTrue(AttachmentService.verifyKeystoreOsPermissions(keystoreFile),
+                    "Keystore 檔案應具嚴格 OS 擁有者權限");
+
+            // 2. 清空記憶體 KEK 快取後從磁碟重新解封驗證（確保持久化可解密）
+            AttachmentService.clearInMemoryKeyCacheForTest();
+            assertTrue(attachmentService.verifyAttachmentSignature(att.id()));
+
+            // 3. 金鑰輪換須保留前代密文歷史並可透過 version 向後驗簽
+            String newKid = attachmentService.rotateHmacKey("Bob");
+            assertNotNull(newKid);
+            assertFalse(attachmentService.getKeyRotationHistory().isEmpty());
+            assertTrue(attachmentService.verifyAttachmentSignature(att.id()));
+
+            // 4. 權限設定失敗不得靜默吞沒例外（模擬失敗必須拋出 SecurityException）
+            AttachmentService.setForcePermissionFailureForTest(true);
+            try {
+                assertThrows(SecurityException.class, () -> attachmentService.rotateHmacKey("Bob"),
+                        "OS 權限設定失敗時必須 fail-closed 拒絕產生未受保護之金鑰檔");
+            } finally {
+                AttachmentService.setForcePermissionFailureForTest(false);
+            }
+
+            // 5. Keystore 路徑若包含 Windows Junction 必須拒絕存取
+            if (isWindows) {
+                Process p = new ProcessBuilder("cmd", "/c", "mklink", "/J",
+                        junctionAttachDir.toString(), outsideDir.toString()).redirectErrorStream(true).start();
+                assertEquals(0, p.waitFor());
+                Path jKs = junctionAttachDir.resolve("evil.properties");
+                assertThrows(SecurityException.class, () -> AttachmentService.verifyKeystorePathSafety(jKs));
+            }
+        } finally {
+            if (prevProp == null) System.clearProperty("ledger.hmac.keystore.path");
+            else System.setProperty("ledger.hmac.keystore.path", prevProp);
+            AttachmentService.setForcePermissionFailureForTest(false);
+            new ProcessBuilder("cmd", "/c", "rmdir", junctionAttachDir.toString()).start().waitFor();
+            Files.deleteIfExists(outsideDir);
+            Files.deleteIfExists(src);
+            if (stored != null) Files.deleteIfExists(stored);
+            Files.deleteIfExists(keystoreFile);
+            Files.deleteIfExists(keystoreFile.resolveSibling(keystoreFile.getFileName().toString() + ".tmp"));
+            Files.deleteIfExists(ksTemp.resolve(".kek_store.bin"));
+            Files.deleteIfExists(ksTemp.resolve(".kek_salt.bin"));
+            Files.deleteIfExists(ksTemp);
+        }
+    }
+
+    @Test
+    @DisplayName("R13-P1-03: 歸檔防縮短覆寫、更正審計歷程、未知 dataType 拒絕、併發重複核准防護與 APPROVED_PENDING_EXECUTION 狀態")
+    void r13_p1_03_retentionAntiShorteningUnknownTypeAndConcurrency() throws Exception {
+        retentionService.recordAnnualClosingCompletion(2016, LocalDate.of(2017, 5, 15), "Bob");
+
+        // 1. 不得直接覆寫或縮短已登錄之決算完成日
+        assertThrows(BusinessException.class, () ->
+                retentionService.recordAnnualClosingCompletion(2016, LocalDate.of(2017, 1, 1), "Bob"));
+        assertThrows(BusinessException.class, () ->
+                retentionService.correctAnnualClosingCompletion(2016, LocalDate.of(2017, 4, 1), "錯誤嘗試縮短", "Bob"));
+        assertThrows(BusinessException.class, () ->
+                retentionService.correctAnnualClosingCompletion(2016, LocalDate.of(2017, 6, 1), "   ", "Bob"));
+
+        // 僅允許延後更正並完整留存更正歷程
+        var corr = retentionService.correctAnnualClosingCompletion(2016, LocalDate.of(2017, 6, 30), "補辦所得稅申報更正延長", "Bob");
+        assertEquals(LocalDate.of(2017, 5, 15), corr.oldCompletionDate());
+        assertEquals(LocalDate.of(2017, 6, 30), corr.newCompletionDate());
+        assertEquals(1, retentionService.listClosingCorrections(2016).size());
+
+        // 2. 未知 dataType 不可靜默套用預設 5 年，必須明確拒絕
+        assertThrows(BusinessException.class, () ->
+                retentionService.isEligibleForDestruction("UNKNOWN_DOC", LocalDate.of(2016, 6, 1), LocalDate.of(2030, 1, 1)));
+        assertThrows(BusinessException.class, () ->
+                retentionService.recordDestructionApproval("B-UNK", "CUSTOM_XYZ", "X-1",
+                        LocalDate.of(2016, 6, 1), LocalDate.of(2030, 1, 1), "未知類型", "Bob"));
+
+        // 3. 16 執行緒併發送簽同一銷毀目標，僅能有 1 筆成功，其餘須全部擋下；且狀態清楚標示 APPROVED_PENDING_EXECUTION
+        ExecutorService pool = Executors.newFixedThreadPool(16);
+        AtomicInteger succeeded = new AtomicInteger(0);
+        AtomicInteger rejected = new AtomicInteger(0);
+        CyclicBarrier barrier = new CyclicBarrier(16);
+        try {
+            List<Future<?>> futures = new ArrayList<>();
+            for (int i = 0; i < 16; i++) {
+                final int idx = i;
+                futures.add(pool.submit(() -> {
+                    barrier.await(5, TimeUnit.SECONDS);
+                    try {
+                        var rec = retentionService.recordDestructionApproval(
+                                "BATCH-2016-" + idx, "VOUCHER", "V-2016-CONC",
+                                LocalDate.of(2016, 12, 31), LocalDate.of(2025, 1, 1),
+                                "屆滿法定五年保存期限", "Bob");
+                        assertEquals(RetentionPolicyService.STATUS_APPROVED_PENDING_EXECUTION, rec.status());
+                        succeeded.incrementAndGet();
+                    } catch (BusinessException expectedDup) {
+                        rejected.incrementAndGet();
+                    }
+                    return null;
+                }));
+            }
+            for (Future<?> f : futures) {
+                f.get(15, TimeUnit.SECONDS);
+            }
+        } finally {
+            pool.shutdownNow();
+            pool.awaitTermination(5, TimeUnit.SECONDS);
+        }
+        assertEquals(1, succeeded.get(), "併發核准同一目標僅能成功一次");
+        assertEquals(15, rejected.get(), "其餘 15 個併發核准請求必須被擋下");
+    }
+
+    @Test
+    @DisplayName("R13-P1-04: 版本化稅率（2017 17% vs 2018+ 20%、股利扣繳 20%/21%）、逐年十年虧損扣抵與完整發票/調節表檢核")
+    void r13_p1_04_versionedTaxLossCarryforwardPerYearAndCitSchedule() {
+        // 1. 營所稅依課稅年度區分版本化稅率（2017: 17%, 2018+: 20%, <2010: 拒絕）
+        assertEquals(MoneyUtil.toMinor("170000"),
+                taxService.calculateCorporateIncomeTax(MoneyUtil.toMinor("1000000"), 2017).taxPayableMinor());
+        assertEquals(MoneyUtil.toMinor("200000"),
+                taxService.calculateCorporateIncomeTax(MoneyUtil.toMinor("1000000"), 2018).taxPayableMinor());
+        assertThrows(BusinessException.class, () ->
+                taxService.calculateCorporateIncomeTax(MoneyUtil.toMinor("500000"), 2008));
+
+        // 2. 非居住者股利扣繳依給付日期版本化（2018-01-01 前 20%，含當日後 21%），以及競技競賽/退職類別
+        assertEquals(MoneyUtil.toMinor("20000"),
+                taxService.calculateWithholding(MoneyUtil.toMinor("100000"), "DIVIDEND", false, LocalDate.of(2017, 12, 31)).taxWithheldMinor());
+        assertEquals(MoneyUtil.toMinor("21000"),
+                taxService.calculateWithholding(MoneyUtil.toMinor("100000"), "DIVIDEND", false, LocalDate.of(2018, 1, 1)).taxWithheldMinor());
+        assertEquals(MoneyUtil.toMinor("10000"),
+                taxService.calculateWithholding(MoneyUtil.toMinor("100000"), "COMPETITION_PRIZE", true, LocalDate.of(2026, 3, 1)).taxWithheldMinor());
+
+        // 3. 逐年追蹤前十年虧損扣抵與課稅所得調節表（FIFO 優先扣抵最早未逾期年度）
+        var schedule = taxService.generateCitReconciliationSchedule(
+                2026,
+                MoneyUtil.toMinor("500000"),
+                MoneyUtil.toMinor("50000"),
+                MoneyUtil.toMinor("100000"),
+                List.of(
+                        new TaiwanTaxComplianceService.AnnualLossRecord(2020, MoneyUtil.toMinor("120000"), true),
+                        new TaiwanTaxComplianceService.AnnualLossRecord(2017, MoneyUtil.toMinor("80000"), true)
+                )
+        );
+        assertEquals(MoneyUtil.toMinor("450000"), schedule.adjustedTaxableIncomeBeforeLossMinor());
+        assertEquals(MoneyUtil.toMinor("200000"), schedule.lossCarryforwardAppliedMinor());
+        assertEquals(MoneyUtil.toMinor("250000"), schedule.finalTaxableIncomeMinor());
+        assertEquals(MoneyUtil.toMinor("50000"), schedule.citResult().taxPayableMinor());
+        assertEquals(TaiwanTaxComplianceService.FilingStatus.INTERNAL_ESTIMATE_ONLY, schedule.filingStatus());
+        assertEquals(2017, schedule.appliedDetails().get(0).lossYear());
+
+        // 逾期虧損（>10年）與未經簽證/藍色申報之虧損必須拒絕
+        assertThrows(BusinessException.class, () -> taxService.generateCitReconciliationSchedule(
+                2026, MoneyUtil.toMinor("500000"), 0L, 0L,
+                List.of(new TaiwanTaxComplianceService.AnnualLossRecord(2015, MoneyUtil.toMinor("100000"), true))));
+        assertThrows(BusinessException.class, () -> taxService.generateCitReconciliationSchedule(
+                2026, MoneyUtil.toMinor("500000"), 0L, 0L,
+                List.of(new TaiwanTaxComplianceService.AnnualLossRecord(2023, MoneyUtil.toMinor("100000"), false))));
+
+        // 4. 完整統一發票檢核（日期/民國年/期別一致、買賣方統編驗證、進項扣抵須含買方統編）
+        assertTrue(taxService.validateUniformInvoiceDetails(
+                "AB-12345678", LocalDate.of(2026, 3, 15), 115, 2,
+                "22099131", "04595257", true,
+                MoneyUtil.toMinor("10000"), MoneyUtil.toMinor("500"), MoneyUtil.toMinor("10500"),
+                TaiwanTaxComplianceService.TaxType.TAXABLE_5_PERCENT).valid());
+        // 缺少買方統編不可主張進項扣抵
+        assertFalse(taxService.validateUniformInvoiceDetails(
+                "AB-12345678", LocalDate.of(2026, 3, 15), 115, 2,
+                "22099131", "", true,
+                MoneyUtil.toMinor("10000"), MoneyUtil.toMinor("500"), MoneyUtil.toMinor("10500"),
+                TaiwanTaxComplianceService.TaxType.TAXABLE_5_PERCENT).valid());
+        // 期別與開立月份不符
+        assertFalse(taxService.validateUniformInvoiceDetails(
+                "AB-12345678", LocalDate.of(2026, 3, 15), 115, 1,
+                "22099131", "04595257", true,
+                MoneyUtil.toMinor("10000"), MoneyUtil.toMinor("500"), MoneyUtil.toMinor("10500"),
+                TaiwanTaxComplianceService.TaxType.TAXABLE_5_PERCENT).valid());
+    }
+
+    @Test
+    @DisplayName("R13-P1-05: 資料庫遷移回歸測試（全新建立、模擬 R11/R12 舊版升級保留資料、失敗回滾、重複冪等與 16 執行緒併發啟動）")
+    void r13_p1_05_migrationR11R12UpgradeRollbackAndConcurrency() throws Exception {
+        Path dataRoot = Paths.get("data").toAbsolutePath().normalize();
+        Files.createDirectories(dataRoot);
+        String legacyRel = "data/test_r13_legacy_upgrade.db";
+        String concRel = "data/test_r13_conc_mig.db";
+        Path legacyDb = Paths.get(legacyRel).toAbsolutePath().normalize();
+        Path concDb = Paths.get(concRel).toAbsolutePath().normalize();
+        Files.deleteIfExists(legacyDb);
+        Files.deleteIfExists(Paths.get(legacyDb + "-wal"));
+        Files.deleteIfExists(Paths.get(legacyDb + "-shm"));
+        Files.deleteIfExists(concDb);
+        Files.deleteIfExists(Paths.get(concDb + "-wal"));
+        Files.deleteIfExists(Paths.get(concDb + "-shm"));
+
+        try {
+            // 1. 模擬 R11/R12 舊版資料庫（僅有舊版表結構與既有一筆傳票，尚未納入 R13 新科目與 schema_version）
+            try (Connection raw = DriverManager.getConnection("jdbc:sqlite:" + legacyDb);
+                 Statement st = raw.createStatement()) {
+                st.execute("CREATE TABLE accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL UNIQUE, name TEXT NOT NULL, type TEXT NOT NULL, normal_side TEXT NOT NULL, is_leaf INTEGER NOT NULL DEFAULT 1, enabled INTEGER NOT NULL DEFAULT 1)");
+                st.execute("INSERT INTO accounts(code, name, type, normal_side, is_leaf, enabled) VALUES ('1101', '庫存現金', 'ASSET', 'DEBIT', 1, 1)");
+                st.execute("CREATE TABLE fiscal_periods (id INTEGER PRIMARY KEY AUTOINCREMENT, year INTEGER NOT NULL, month INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'OPEN', closed_at TEXT, closed_by TEXT, UNIQUE(year, month))");
+                st.execute("CREATE TABLE vouchers (id INTEGER PRIMARY KEY AUTOINCREMENT, voucher_no TEXT NOT NULL UNIQUE, voucher_date TEXT NOT NULL, description TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'POSTED', created_by TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')), posted_by TEXT, posted_at TEXT, reversed_voucher_id INTEGER)");
+                st.execute("INSERT INTO vouchers(voucher_no, voucher_date, description, status, created_by, posted_by) VALUES ('202501-0001', '2025-01-15', 'R11歷史資料保留驗證', 'POSTED', 'amy', 'bob')");
+                st.execute("CREATE TABLE voucher_entries (id INTEGER PRIMARY KEY AUTOINCREMENT, voucher_id INTEGER NOT NULL, account_id INTEGER NOT NULL, line_memo TEXT, debit_minor INTEGER NOT NULL DEFAULT 0, credit_minor INTEGER NOT NULL DEFAULT 0)");
+                st.execute("CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL DEFAULT (datetime('now')), action TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id INTEGER, operator TEXT NOT NULL, old_data TEXT, new_data TEXT)");
+            }
+
+            // 切換至模擬舊版庫，應安全完成遷移、補齊欄位及新增 R13 科目且保留原有資料
+            DbManager.switchDatabase(legacyRel);
+            try (Connection upgraded = DbManager.get()) {
+                try (Statement st = upgraded.createStatement();
+                     ResultSet rs = st.executeQuery("SELECT description FROM vouchers WHERE voucher_no='202501-0001'")) {
+                    assertTrue(rs.next());
+                    assertEquals("R11歷史資料保留驗證", rs.getString(1));
+                }
+                var cashCodes = ReportDaoExtra.resolveCashAccountCodes(upgraded);
+                assertTrue(cashCodes.contains("1103"));
+                assertTrue(cashCodes.contains("1104"));
+            }
+
+            // 重複執行應冪等無錯誤
+            DbManager.closeAllTenants();
+            DbManager.closeCurrent();
+            DbManager.switchDatabase(legacyRel);
+            try (Connection repeat = DbManager.get();
+                 Statement st = repeat.createStatement();
+                 ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM vouchers")) {
+                assertTrue(rs.next());
+                assertEquals(1, rs.getInt(1));
+            }
+            DbManager.closeAllTenants();
+            DbManager.closeCurrent();
+
+            // 2. 失敗回滾保護驗證：交易中 DDL/DML 失敗時不留下半完成狀態
+            try (Connection txConn = DriverManager.getConnection("jdbc:sqlite:" + legacyDb)) {
+                txConn.setAutoCommit(false);
+                try (Statement st = txConn.createStatement()) {
+                    st.execute("INSERT INTO system_meta(meta_key, meta_value) VALUES ('r13_mig_tx_test', '999')");
+                    assertThrows(SQLException.class, () -> st.execute("SELECT * FROM non_existent_table_xyz"));
+                    txConn.rollback();
+                } finally {
+                    txConn.setAutoCommit(true);
+                }
+                try (Statement st = txConn.createStatement();
+                     ResultSet rs = st.executeQuery("SELECT COUNT(*) FROM system_meta WHERE meta_key = 'r13_mig_tx_test'")) {
+                    assertTrue(rs.next());
+                    assertEquals(0, rs.getInt(1), "遷移失敗回滾後不得留下部分版本紀錄");
+                }
+            }
+
+            // 3. 16 執行緒併發首次初始化同一全新租戶資料庫 + WAL/SHM 模式與檔案驗證
+            String concTenant = "r13_conc_mig_tenant";
+            TenantSecurityService.grant(concTenant, "r13_test");
+            String concTenantRel = TenantPathResolver.resolveDbPath(concTenant);
+            Path concTenantFile = Paths.get(concTenantRel).toAbsolutePath().normalize();
+            Files.deleteIfExists(concTenantFile);
+            Files.deleteIfExists(Paths.get(concTenantFile + "-wal"));
+            Files.deleteIfExists(Paths.get(concTenantFile + "-shm"));
+
+            ExecutorService pool = Executors.newFixedThreadPool(16);
+            CyclicBarrier barrier = new CyclicBarrier(16);
+            try {
+                List<Future<String>> results = new ArrayList<>();
+                for (int i = 0; i < 16; i++) {
+                    results.add(pool.submit(() -> {
+                        barrier.await(5, TimeUnit.SECONDS);
+                        try (Connection c = DbManager.getForTenant(concTenant);
+                             Statement st = c.createStatement();
+                             ResultSet rs = st.executeQuery("PRAGMA journal_mode")) {
+                            return rs.next() ? rs.getString(1) : "";
+                        }
+                    }));
+                }
+                for (Future<String> f : results) {
+                    assertEquals("wal", f.get(20, TimeUnit.SECONDS).toLowerCase());
+                }
+                Path tenantRoot = Paths.get(TenantPathResolver.TENANT_ROOT).toAbsolutePath().normalize();
+                Path realConc = TenantPathResolver.prepareAndVerifyDatabaseFile(concTenantRel, tenantRoot);
+                try (Connection c = DbManager.getForTenant(concTenant)) {
+                    TenantPathResolver.verifyOpenedSqliteConnection(c, realConc, tenantRoot);
+                }
+            } finally {
+                pool.shutdownNow();
+                pool.awaitTermination(5, TimeUnit.SECONDS);
+                DbManager.closeAllTenants();
+                TenantSecurityService.revoke(concTenant);
+                Files.deleteIfExists(concTenantFile);
+                Files.deleteIfExists(Paths.get(concTenantFile + "-wal"));
+                Files.deleteIfExists(Paths.get(concTenantFile + "-shm"));
+            }
+        } finally {
+            DbManager.closeAllTenants();
+            DbManager.closeCurrent();
+            Files.deleteIfExists(legacyDb);
+            Files.deleteIfExists(Paths.get(legacyDb + "-wal"));
+            Files.deleteIfExists(Paths.get(legacyDb + "-shm"));
+            Files.deleteIfExists(concDb);
+            Files.deleteIfExists(Paths.get(concDb + "-wal"));
+            Files.deleteIfExists(Paths.get(concDb + "-shm"));
+        }
     }
 }

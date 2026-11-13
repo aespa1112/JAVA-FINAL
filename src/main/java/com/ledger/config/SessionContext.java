@@ -26,19 +26,22 @@ public final class SessionContext {
         private final String sessionId;
         private final String username;
         private final String displayName;
+        private final long epoch;
         private final Instant createdAt;
         private final AtomicBoolean active = new AtomicBoolean(true);
 
-        SessionInfo(String sessionId, String username, String displayName) {
+        SessionInfo(String sessionId, String username, String displayName, long epoch) {
             this.sessionId = sessionId;
             this.username = username;
             this.displayName = displayName;
+            this.epoch = epoch;
             this.createdAt = Instant.now();
         }
 
         public String getSessionId() { return sessionId; }
         public String getUsername() { return username; }
         public String getDisplayName() { return displayName; }
+        public long getEpoch() { return epoch; }
         public Instant getCreatedAt() { return createdAt; }
         public boolean isActive() { return active.get(); }
     }
@@ -50,8 +53,10 @@ public final class SessionContext {
     private static final ThreadLocal<String> currentSessionId = new ThreadLocal<>();
     private static final ThreadLocal<Boolean> enabled = ThreadLocal.withInitial(() -> Boolean.TRUE);
 
+    private static final Object SESSION_STATE_LOCK = new Object();
     private static final Map<String, SessionInfo> activeSessions = new ConcurrentHashMap<>();
     private static final Set<String> revokedUsers = ConcurrentHashMap.newKeySet();
+    private static final Map<String, Long> userRevocationEpoch = new ConcurrentHashMap<>();
 
     private static final StackWalker STACK_WALKER =
             StackWalker.getInstance(StackWalker.Option.RETAIN_CLASS_REFERENCE);
@@ -102,6 +107,16 @@ public final class SessionContext {
         return s.toLowerCase();
     }
 
+    public static Object getSessionStateLock() {
+        return SESSION_STATE_LOCK;
+    }
+
+    public static long getUserRevocationEpoch(String username) {
+        synchronized (SESSION_STATE_LOCK) {
+            return userRevocationEpoch.getOrDefault(normalizeUsernameKey(username), 0L);
+        }
+    }
+
     /**
      * Establish an authenticated session from a credential-verified AuthService token.
      * Direct callers outside AuthService are rejected.
@@ -118,13 +133,26 @@ public final class SessionContext {
             throw new BusinessException("已停用帳號不可建立 Session: " + token.username());
         }
         String normLower = normalizeUsernameKey(token.username());
-        if (revokedUsers.contains(normLower)) {
-            throw new BusinessException("此帳號已停用或憑證已撤銷，禁止建立 Session: " + token.username());
+        synchronized (SESSION_STATE_LOCK) {
+            if (revokedUsers.contains(normLower)) {
+                throw new BusinessException("此帳號已停用或憑證已撤銷，禁止建立 Session: " + token.username());
+            }
+            long currentEpoch = userRevocationEpoch.getOrDefault(normLower, 0L);
+            if (token.epoch() != currentEpoch) {
+                throw new BusinessException("登入期間帳號狀態已撤銷或變更，拒絕建立過時 Session: " + token.username());
+            }
+            setUser(token.username(), token.displayName(), currentEpoch);
         }
-        setUser(token.username(), token.displayName());
     }
 
     private static void setUser(String canonicalName, String displayName) {
+        synchronized (SESSION_STATE_LOCK) {
+            long currentEpoch = userRevocationEpoch.getOrDefault(normalizeUsernameKey(canonicalName), 0L);
+            setUser(canonicalName, displayName, currentEpoch);
+        }
+    }
+
+    private static void setUser(String canonicalName, String displayName, long epoch) {
         String previousSid = currentSessionId.get();
         if (previousSid != null) {
             SessionInfo prev = activeSessions.remove(previousSid);
@@ -142,7 +170,7 @@ public final class SessionContext {
             throw new BusinessException("此帳號已停用或憑證已撤銷，禁止建立 Session: " + canonicalName);
         }
         String sid = UUID.randomUUID().toString();
-        SessionInfo info = new SessionInfo(sid, canonicalName, displayName != null ? displayName : canonicalName);
+        SessionInfo info = new SessionInfo(sid, canonicalName, displayName != null ? displayName : canonicalName, epoch);
         activeSessions.put(sid, info);
         currentSessionId.set(sid);
         currentUser.set(canonicalName);
@@ -190,11 +218,13 @@ public final class SessionContext {
     }
 
     public static void clear() {
-        String sid = currentSessionId.get();
-        if (sid != null) {
-            SessionInfo info = activeSessions.remove(sid);
-            if (info != null) {
-                info.active.set(false);
+        synchronized (SESSION_STATE_LOCK) {
+            String sid = currentSessionId.get();
+            if (sid != null) {
+                SessionInfo info = activeSessions.remove(sid);
+                if (info != null) {
+                    info.active.set(false);
+                }
             }
         }
         currentSessionId.remove();
@@ -213,19 +243,26 @@ public final class SessionContext {
             return false;
         }
         String uLower = normalizeUsernameKey(u);
-        if (revokedUsers.contains(uLower)) {
-            return false;
+        synchronized (SESSION_STATE_LOCK) {
+            if (revokedUsers.contains(uLower)) {
+                return false;
+            }
+            SessionInfo info = activeSessions.get(sid);
+            long currentEpoch = userRevocationEpoch.getOrDefault(uLower, 0L);
+            return info != null && info.active.get()
+                    && info.epoch == currentEpoch
+                    && normalizeUsernameKey(info.username).equals(uLower);
         }
-        SessionInfo info = activeSessions.get(sid);
-        return info != null && info.active.get() && normalizeUsernameKey(info.username).equals(uLower);
     }
 
     public static void invalidate() {
-        String sid = currentSessionId.get();
-        if (sid != null) {
-            SessionInfo info = activeSessions.remove(sid);
-            if (info != null) {
-                info.active.set(false);
+        synchronized (SESSION_STATE_LOCK) {
+            String sid = currentSessionId.get();
+            if (sid != null) {
+                SessionInfo info = activeSessions.remove(sid);
+                if (info != null) {
+                    info.active.set(false);
+                }
             }
         }
         enabled.set(Boolean.FALSE);
@@ -244,18 +281,21 @@ public final class SessionContext {
             return;
         }
         String normLower = normalizeUsernameKey(username);
-        revokedUsers.add(normLower);
-        activeSessions.entrySet().removeIf(entry -> {
-            SessionInfo info = entry.getValue();
-            if (info != null && normalizeUsernameKey(info.username).equals(normLower)) {
-                info.active.set(false);
-                return true;
+        synchronized (SESSION_STATE_LOCK) {
+            userRevocationEpoch.merge(normLower, 1L, Long::sum);
+            revokedUsers.add(normLower);
+            activeSessions.entrySet().removeIf(entry -> {
+                SessionInfo info = entry.getValue();
+                if (info != null && normalizeUsernameKey(info.username).equals(normLower)) {
+                    info.active.set(false);
+                    return true;
+                }
+                return false;
+            });
+            String cur = currentUser.get();
+            if (cur != null && normalizeUsernameKey(cur).equals(normLower)) {
+                invalidate();
             }
-            return false;
-        });
-        String cur = currentUser.get();
-        if (cur != null && normalizeUsernameKey(cur).equals(normLower)) {
-            invalidate();
         }
     }
 
@@ -264,8 +304,10 @@ public final class SessionContext {
         if (caller != AuthService.class) {
             throw new SecurityException("Only AuthService may clear user revocation");
         }
-        if (username != null && !username.isBlank()) {
-            revokedUsers.remove(normalizeUsernameKey(username));
+        synchronized (SESSION_STATE_LOCK) {
+            if (username != null && !username.isBlank()) {
+                revokedUsers.remove(normalizeUsernameKey(username));
+            }
         }
     }
 
